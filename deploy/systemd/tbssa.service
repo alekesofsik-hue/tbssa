@@ -1,0 +1,44 @@
+[Unit]
+Description=Telegram Bot - Server Supervisor (tbssa)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ezovskikh_a
+WorkingDirectory=/home/ezovskikh_a/apps/tbssa
+
+# Prefer explicit env file with 0600 permissions
+EnvironmentFile=/home/ezovskikh_a/apps/tbssa/.env
+Environment="PYTHONUNBUFFERED=1"
+
+ExecStart=/usr/bin/python3 -m tbssa
+Restart=always
+RestartSec=5
+
+# --- Hardening ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+# Allow reading only required SSH files
+ReadOnlyPaths=/home/ezovskikh_a/.ssh/id_ed25519_bot /home/ezovskikh_a/.ssh/known_hosts
+
+[Install]
+WantedBy=multi-user.target
+
