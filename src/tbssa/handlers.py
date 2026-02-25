@@ -1,208 +1,321 @@
 from __future__ import annotations
 
 import asyncio
-import secrets
 import time
+from datetime import datetime
 from functools import wraps
 from typing import Awaitable, Callable, TypeVar
 
-from telegram import Update
-from telegram.ext import ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
+from telegram.ext import CallbackQueryHandler, ContextTypes
 
-from tbssa.ping import ping_status
-from tbssa.settings import parse_admin_ids
+from tbssa.config_service import ConfigService, ServerConfig
 from tbssa.ssh import ps, ssh_exec
-
 
 T = TypeVar("T")
 
-
-def _now() -> float:
-    return time.time()
-
-
-def _gen_confirm_code() -> str:
-    # Short, copy-paste friendly token
-    return secrets.token_hex(3)  # 6 hex chars
+_RU_MONTHS = [
+    "", "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+]
 
 
-def admin_only(*, admin_ids_raw: str) -> Callable[[Callable[..., Awaitable[T]]], Callable[..., Awaitable[T]]]:
-    admin_ids = parse_admin_ids(admin_ids_raw)
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-    def decorator(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
-        @wraps(func)
-        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> T | None:
-            uid = update.effective_user.id if update.effective_user else None
-            if not admin_ids:
-                await update.effective_chat.send_message(
-                    "⛔ Админ-команды отключены: `ADMIN_IDS` не настроен.",
-                    parse_mode="Markdown",
-                )
-                return None
-            if uid is None or uid not in admin_ids:
-                await update.effective_chat.send_message("⛔ Доступ запрещён.")
-                return None
-            return await func(update, context)
 
-        return wrapper
+def _svc(context: ContextTypes.DEFAULT_TYPE) -> ConfigService:
+    return context.bot_data["config_service"]
 
-    return decorator
+
+def _fmt_date(dt: datetime) -> str:
+    return f"{dt.day} {_RU_MONTHS[dt.month]} {dt.year} г."
+
+
+# ── Guard decorator ───────────────────────────────────────────────────────────
+
+
+def admin_required(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
+    """Deny access if user is not in config_service admin list (fail-closed)."""
+
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> T | None:
+        uid = update.effective_user.id if update.effective_user else None
+        svc = _svc(context)
+
+        if not svc.is_ready():
+            await update.effective_chat.send_message(
+                "⛔ Бот ещё не готов. Попробуйте через несколько секунд."
+            )
+            return None
+
+        if not svc.is_admin(uid):
+            await update.effective_chat.send_message("⛔ Доступ запрещён.")
+            return None
+
+        return await func(update, context)
+
+    return wrapper
+
+
+# ── /start ─────────────────────────────────────────────────────────────────────
+
+
+def _sos_label(svc: ConfigService) -> str:
+    return svc.get_str("SOS_BUTTON_LABEL", "SOS")
+
+
+def _admin_start_keyboard(svc: ConfigService) -> InlineKeyboardMarkup:
+    label = _sos_label(svc)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data="start:sos")],
+    ])
+
+
+def _sos_confirm_keyboard(svc: ConfigService) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Подтвердить", callback_data="start:sos:confirm"),
+            InlineKeyboardButton("❌ Отмена", callback_data="start:sos:cancel"),
+        ]
+    ])
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id if update.effective_user else None
+    svc = _svc(context)
+
+    if svc.is_ready() and svc.is_admin(uid):
+        from tbssa.admin.users import sync_admin_from_telegram
+        u = update.effective_user
+        if u:
+            await sync_admin_from_telegram(uid, u.username, u.first_name)
+        await update.message.reply_text(
+            "🛠 Управление",
+            reply_markup=_admin_start_keyboard(svc),
+        )
+    else:
+        now = datetime.now()
+        await update.message.reply_text(
+            f"Здравствуйте! Сегодня {_fmt_date(now)}, "
+            f"текущее время {now.strftime('%H:%M')}. До свидания!"
+        )
+
+
+async def my_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /my — показать свой ID незарегистрированному пользователю."""
+    uid = update.effective_user.id if update.effective_user else 0
     await update.message.reply_text(
-        "Привет! Мини-бот для управления сервером Windows.\n"
-        "Команды:\n"
-        "/status — пинг до сервера (с VPS)\n"
-        "/reboot — перезагрузка (с подтверждением)\n"
-        "/sos — жёсткое выключение (с подтверждением)\n"
-        "/me — показать твой chat_id",
+        f"Ваш ID: <code>{uid}</code>\n\n"
+        "Сообщите его владельцу бота для получения доступа.",
+        parse_mode=ParseMode.HTML,
     )
 
 
-async def me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cid = update.effective_chat.id
-    uid = update.effective_user.id if update.effective_user else None
-    await update.message.reply_text(f"chat_id = {cid}\nuser_id = {uid}")
+# ── SOS execution helper ──────────────────────────────────────────────────────
 
 
-async def status_cmd(
-    *,
+def _get_sos_edit_fn(update: Update, context: ContextTypes.DEFAULT_TYPE, svc: ConfigService):
+    """Return an async function to show progress/result; works with callback_query or message."""
+    if update.callback_query:
+        async def edit(text: str, **kwargs) -> None:
+            await update.callback_query.edit_message_text(text, **kwargs)
+        return edit
+    # From message (command or "sos"/"сос" text)
+    sent = []
+
+    async def edit(text: str, **kwargs) -> None:
+        if not sent:
+            msg = await update.effective_chat.send_message(text, **kwargs)
+            sent.append(msg)
+        else:
+            await sent[0].edit_text(text, **kwargs)
+
+    return edit
+
+
+async def _exec_sos_all(
     update: Update,
+    uid: int,
+    uname: str | None,
+    svc: ConfigService,
     context: ContextTypes.DEFAULT_TYPE,
-    ping_host: str,
-    ping_count: int,
-    ping_timeout: int,
 ) -> None:
-    await update.message.reply_text("Пингую сервер… ⏳")
-    ok, rtts = await asyncio.to_thread(ping_status, ping_host, ping_count, ping_timeout)
-    if ok == 0:
-        await update.message.reply_text(
-            "🔴 Сервер *недоступен* по ICMP с VPS.\n"
-            f"Хост: `{ping_host}`\n"
-            f"Попыток: {ping_count}, успешно: 0",
-            parse_mode="Markdown",
+    """Shut down all active servers and notify all admins."""
+    edit_fn = _get_sos_edit_fn(update, context, svc)
+
+    servers = svc.get_servers()
+    if not servers:
+        await edit_fn(
+            "⚠️ Нет активных серверов.",
+            reply_markup=_admin_start_keyboard(svc),
         )
         return
-    avg = sum(rtts) / len(rtts)
-    best = min(rtts)
-    worst = max(rtts)
-    await update.message.reply_text(
-        "🟢 Сервер *доступен* по ICMP.\n"
-        f"Хост: `{ping_host}`\n"
-        f"Успешно: {ok}/{ping_count}\n"
-        f"RTT (мс): min={best:.1f}  avg={avg:.1f}  max={worst:.1f}",
-        parse_mode="Markdown",
+
+    names = ", ".join(f"<b>{s.name}</b>" for s in servers)
+    await edit_fn(
+        f"🆘 <b>SOS — выключаю {len(servers)} сервер(а):</b> {names}…",
+        parse_mode=ParseMode.HTML,
     )
 
+    poweroff_cmd = ps(svc.get_str("SSH_CMD_POWEROFF", "shutdown /p /f"))
 
-def _confirm_key(command: str) -> str:
-    return f"confirm:{command}"
+    async def _shutdown_one(s: ServerConfig) -> tuple[str, int, str | None]:
+        try:
+            rc, _, err = await asyncio.to_thread(
+                ssh_exec,
+                host=s.ssh_host,
+                user=s.ssh_user,
+                key_path=s.ssh_key_path,
+                known_hosts_path=s.ssh_known_hosts_path,
+                pinned_fingerprint_md5=s.ssh_fingerprint,
+                connect_timeout=s.ssh_connect_timeout,
+                command_timeout=s.ssh_command_timeout,
+                cmd=poweroff_cmd,
+            )
+            return s.name, rc, err
+        except Exception as exc:
+            return s.name, -1, str(exc)
 
+    results = await asyncio.gather(*[_shutdown_one(s) for s in servers])
 
-async def require_confirmation(
-    *,
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    command: str,
-    ttl_seconds: int,
-) -> bool:
-    """
-    Two-step confirmation:
-    1) /<cmd> -> bot replies with /<cmd> <code>
-    2) /<cmd> <code> within TTL -> confirmed
-    """
-    # Parse argument (code)
-    text = (update.message.text or "").strip() if update.message else ""
-    parts = text.split(maxsplit=1)
-    provided = parts[1].strip() if len(parts) == 2 else ""
+    header = svc.get_str("SOS_MSG_HEADER", "SOS выполнен")
+    lines: list[str] = [f"🆘 <b>{header}</b>\n"]
+    for name, rc, err in results:
+        if rc == 0:
+            lines.append(f"🖥 {name}: ✅ команда принята")
+        elif rc == -1:
+            lines.append(f"🖥 {name}: ❌ ошибка: {err}")
+        else:
+            lines.append(f"🖥 {name}: ⚠️ rc={rc}")
+        await svc.write_audit(uid, uname, "sos:all", f"server={name} rc={rc}")
 
-    key = _confirm_key(command)
-    state = context.user_data.get(key) if context.user_data is not None else None
+    who = f"@{uname}" if uname else f"id:{uid}"
+    lines.append(f"\nИнициировал: {who}")
+    report = "\n".join(lines)
 
-    if isinstance(state, dict):
-        code = str(state.get("code", ""))
-        exp = float(state.get("exp", 0))
-        if provided and provided == code and _now() <= exp:
-            # consume
-            context.user_data.pop(key, None)
-            return True
-
-    # generate new
-    code = _gen_confirm_code()
-    exp = _now() + max(10, int(ttl_seconds))
-    context.user_data[key] = {"code": code, "exp": exp}
-    await update.message.reply_text(
-        "⚠️ Подтверждение требуется.\n"
-        f"Повторите команду в течение {ttl_seconds}с:\n"
-        f"`/{command} {code}`",
-        parse_mode="Markdown",
+    await edit_fn(
+        report,
+        reply_markup=_admin_start_keyboard(svc),
+        parse_mode=ParseMode.HTML,
     )
-    return False
+
+    for admin_id in svc.get_admin_ids():
+        if admin_id == uid:
+            continue
+        try:
+            await context.bot.send_message(admin_id, report, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
 
 
-async def reboot_cmd(
-    *,
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    ttl_seconds: int,
-    ssh_host: str,
-    ssh_user: str,
-    ssh_key_path: str,
-    ssh_known_hosts_path: str,
-    ssh_pinned_fingerprint: str,
-    ssh_connect_timeout: int,
-    ssh_command_timeout: int,
-) -> None:
-    if not await require_confirmation(update=update, context=context, command="reboot", ttl_seconds=ttl_seconds):
+# ── SOS-all callback (from /start button) ─────────────────────────────────────
+
+
+async def sos_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """SOS button pressed: either ask for confirmation or execute immediately."""
+    query = update.callback_query
+    await query.answer()
+
+    uid = update.effective_user.id if update.effective_user else 0
+    svc = _svc(context)
+
+    if not svc.is_ready() or not svc.is_admin(uid):
+        await query.edit_message_text("⛔ Доступ запрещён.")
         return
-    await update.message.reply_text("Перезагружаю сервер… ♻️")
-    rc, _, err = await asyncio.to_thread(
-        ssh_exec,
-        host=ssh_host,
-        user=ssh_user,
-        key_path=ssh_key_path,
-        known_hosts_path=ssh_known_hosts_path,
-        pinned_fingerprint_md5=ssh_pinned_fingerprint,
-        connect_timeout=ssh_connect_timeout,
-        command_timeout=ssh_command_timeout,
-        cmd=ps("shutdown /r /t 0 /f"),
-    )
-    if rc != 0:
-        await update.message.reply_text(f"⚠️ Команда вернула rc={rc}\nstderr:\n{(err or '')[:600]}")
-    else:
-        await update.message.reply_text("Ок. Команда отправлена. Сервер уходит в перезагрузку.")
 
-
-async def sos_cmd(
-    *,
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    ttl_seconds: int,
-    ssh_host: str,
-    ssh_user: str,
-    ssh_key_path: str,
-    ssh_known_hosts_path: str,
-    ssh_pinned_fingerprint: str,
-    ssh_connect_timeout: int,
-    ssh_command_timeout: int,
-) -> None:
-    if not await require_confirmation(update=update, context=context, command="sos", ttl_seconds=ttl_seconds):
+    if svc.get_int("SOS_REQUIRE_CONFIRM", 0):
+        label = _sos_label(svc)
+        await query.edit_message_text(
+            f"⚠️ <b>Вы уверены, что хотите выполнить {label}?</b>\n\n"
+            "Все активные серверы будут немедленно выключены.",
+            reply_markup=_sos_confirm_keyboard(svc),
+            parse_mode=ParseMode.HTML,
+        )
         return
-    await update.message.reply_text("Жёсткое выключение… ⚡")
-    rc, _, err = await asyncio.to_thread(
-        ssh_exec,
-        host=ssh_host,
-        user=ssh_user,
-        key_path=ssh_key_path,
-        known_hosts_path=ssh_known_hosts_path,
-        pinned_fingerprint_md5=ssh_pinned_fingerprint,
-        connect_timeout=ssh_connect_timeout,
-        command_timeout=ssh_command_timeout,
-        cmd=ps("shutdown /p /f"),
-    )
-    if rc != 0:
-        await update.message.reply_text(f"⚠️ Команда вернула rc={rc}\nstderr:\n{(err or '')[:600]}")
-    else:
-        await update.message.reply_text("Ок. Команда отправлена. Сервер сейчас выключится.")
 
+    uname = update.effective_user.username if update.effective_user else None
+    await _exec_sos_all(update, uid, uname, svc, context)
+
+
+async def sos_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Confirmation button 'Подтвердить' — execute SOS."""
+    query = update.callback_query
+    await query.answer("🆘 SOS активирован!", show_alert=False)
+
+    uid = update.effective_user.id if update.effective_user else 0
+    uname = update.effective_user.username if update.effective_user else None
+    svc = _svc(context)
+
+    if not svc.is_ready() or not svc.is_admin(uid):
+        await query.edit_message_text("⛔ Доступ запрещён.")
+        return
+
+    await _exec_sos_all(update, uid, uname, svc, context)
+
+
+async def sos_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Confirmation button 'Отмена' — return to start menu."""
+    query = update.callback_query
+    await query.answer("Отменено.")
+
+    uid = update.effective_user.id if update.effective_user else 0
+    svc = _svc(context)
+
+    if not svc.is_ready() or not svc.is_admin(uid):
+        await query.edit_message_text("⛔ Доступ запрещён.")
+        return
+
+    await query.edit_message_text(
+        "🛠 Управление",
+        reply_markup=_admin_start_keyboard(svc),
+    )
+
+
+# ── /sos command (same as SOS button: global shutdown of all servers) ─────────
+
+
+async def _trigger_sos_from_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Trigger SOS from message (command /sos or text "sos"/"сос").
+    Same logic as SOS button: shutdown all active servers, with optional confirmation.
+    """
+    svc = _svc(context)
+    servers = svc.get_servers()
+    if not servers:
+        await update.message.reply_text("⚠️ Нет активных серверов.")
+        return
+
+    uid = update.effective_user.id if update.effective_user else 0
+    uname = update.effective_user.username if update.effective_user else None
+
+    if svc.get_int("SOS_REQUIRE_CONFIRM", 0):
+        label = _sos_label(svc)
+        await update.message.reply_text(
+            f"⚠️ <b>Вы уверены, что хотите выполнить {label}?</b>\n\n"
+            "Все активные серверы будут немедленно выключены.",
+            reply_markup=_sos_confirm_keyboard(svc),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await _exec_sos_all(update, uid, uname, svc, context)
+
+
+@admin_required
+async def sos_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Command /sos — same as SOS button: global shutdown of all active servers."""
+    await _trigger_sos_from_message(update, context)
+
+
+def get_server_cmd_handlers() -> list:
+    """No longer used: SOS is global, no server picker."""
+    return []
+
+
+def get_start_handlers() -> list:
+    return [
+        CallbackQueryHandler(sos_start_callback, pattern=r"^start:sos$"),
+        CallbackQueryHandler(sos_confirm_callback, pattern=r"^start:sos:confirm$"),
+        CallbackQueryHandler(sos_cancel_callback, pattern=r"^start:sos:cancel$"),
+    ]

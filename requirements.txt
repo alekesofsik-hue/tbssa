@@ -1,0 +1,4 @@
+# tbssa dependencies (pinned)
+python-telegram-bot==20.8
+paramiko==3.4.0
+pydantic-settings==2.11.0

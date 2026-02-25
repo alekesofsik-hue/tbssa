@@ -3,73 +3,79 @@ from __future__ import annotations
 from telegram.ext import ApplicationBuilder, CommandHandler
 from telegram.request import HTTPXRequest
 
-from tbssa.handlers import (
-    admin_only,
-    me,
-    reboot_cmd,
-    sos_cmd,
-    start,
-    status_cmd,
-)
+from tbssa.admin.broadcast import get_broadcast_handlers
+from tbssa.admin.handlers import get_admin_handlers
+from tbssa.admin.journal import get_journal_handlers
+from tbssa.admin.monitor import check_servers_job
+from tbssa.admin.servers import get_server_handlers
+from tbssa.admin.settings import get_settings_handlers
+from tbssa.admin.users import get_user_handlers
+from tbssa.config_service import ConfigService
+from tbssa.handlers import get_server_cmd_handlers, get_start_handlers, my_cmd, sos_cmd, start
 from tbssa.settings import Settings
 
 
-def build_app(settings: Settings):
+def build_app(settings: Settings, config_service: ConfigService):
     request = HTTPXRequest(
         connect_timeout=15.0,
         read_timeout=60.0,
         write_timeout=15.0,
         pool_timeout=10.0,
     )
-    app = ApplicationBuilder().token(settings.TELEGRAM_BOT_TOKEN).request(request).build()
 
-    # Public
+    interval_minutes = config_service.get_int("PING_CHECK_INTERVAL_MINUTES", 5)
+
+    async def _post_init(application) -> None:
+        application.job_queue.run_repeating(
+            check_servers_job,
+            interval=interval_minutes * 60,
+            first=30,  # first check 30s after bot starts
+        )
+
+    app = (
+        ApplicationBuilder()
+        .token(settings.TELEGRAM_BOT_TOKEN)
+        .request(request)
+        .post_init(_post_init)
+        .build()
+    )
+
+    # ConfigService is accessible in all handlers via context.bot_data
+    app.bot_data["config_service"] = config_service
+
+    # ── Public commands ───────────────────────────────────────────────────────
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("me", me))
+    app.add_handler(CommandHandler("my", my_cmd))  # узнать свой ID
 
-    # Admin
-    admin = admin_only(admin_ids_raw=settings.ADMIN_IDS)
+    # ── /sos command (same as SOS button: global shutdown) ───────────────────
+    app.add_handler(CommandHandler("sos", sos_cmd))
 
-    async def _status(update, context):
-        return await status_cmd(
-            update=update,
-            context=context,
-            ping_host=settings.PING_HOST,
-            ping_count=settings.PING_COUNT,
-            ping_timeout=settings.PING_TIMEOUT,
-        )
+    # ── /start SOS button callback ───────────────────────────────────────────
+    for handler in get_start_handlers():
+        app.add_handler(handler)
 
-    async def _reboot(update, context):
-        return await reboot_cmd(
-            update=update,
-            context=context,
-            ttl_seconds=settings.CONFIRM_TTL_SECONDS,
-            ssh_host=settings.SSH_HOST,
-            ssh_user=settings.SSH_USER,
-            ssh_key_path=settings.SSH_KEY_PATH,
-            ssh_known_hosts_path=settings.SSH_KNOWN_HOSTS_PATH,
-            ssh_pinned_fingerprint=settings.SSH_HOST_KEY_FINGERPRINT,
-            ssh_connect_timeout=settings.SSH_CONNECT_TIMEOUT,
-            ssh_command_timeout=settings.SSH_COMMAND_TIMEOUT,
-        )
+    # ── SOS button callbacks (start:sos, confirm, cancel) ────────────────────
+    for handler in get_server_cmd_handlers():
+        app.add_handler(handler)
 
-    async def _sos(update, context):
-        return await sos_cmd(
-            update=update,
-            context=context,
-            ttl_seconds=settings.CONFIRM_TTL_SECONDS,
-            ssh_host=settings.SSH_HOST,
-            ssh_user=settings.SSH_USER,
-            ssh_key_path=settings.SSH_KEY_PATH,
-            ssh_known_hosts_path=settings.SSH_KNOWN_HOSTS_PATH,
-            ssh_pinned_fingerprint=settings.SSH_HOST_KEY_FINGERPRINT,
-            ssh_connect_timeout=settings.SSH_CONNECT_TIMEOUT,
-            ssh_command_timeout=settings.SSH_COMMAND_TIMEOUT,
-        )
+    # ── Admin panel: ConversationHandlers first (priority matters) ───────────
+    for handler in get_server_handlers():
+        app.add_handler(handler)
 
-    app.add_handler(CommandHandler("status", admin(_status)))
-    app.add_handler(CommandHandler("reboot", admin(_reboot)))
-    app.add_handler(CommandHandler("sos", admin(_sos)))
+    for handler in get_user_handlers():
+        app.add_handler(handler)
+
+    for handler in get_settings_handlers():
+        app.add_handler(handler)
+
+    for handler in get_broadcast_handlers():
+        app.add_handler(handler)
+
+    for handler in get_journal_handlers():
+        app.add_handler(handler)
+
+    # ── Admin panel: main menu ────────────────────────────────────────────────
+    for handler in get_admin_handlers():
+        app.add_handler(handler)
 
     return app
-

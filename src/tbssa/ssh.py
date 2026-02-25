@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import binascii
+import os
 import time
 
 import paramiko
@@ -48,6 +48,8 @@ def ssh_exec(
     known_hosts_path: str,
     pinned_fingerprint_md5: str,
 ) -> tuple[int, str, str]:
+    key_path = os.path.expanduser(key_path)
+    known_hosts_path = os.path.expanduser(known_hosts_path)
     key = paramiko.Ed25519Key.from_private_key_file(key_path)
     client = paramiko.SSHClient()
     try:

@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tbssa"
+version = "0.1.0"
+description = "Telegram Bot — Server Supervisor Assistant (мониторинг и управление Windows-сервером)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.12"
+dependencies = [
+  "python-telegram-bot[job-queue]==20.8",
+  "paramiko==3.4.0",
+  "pydantic-settings==2.11.0",
+  "sqlalchemy>=2.0",
+  "aiosqlite>=0.20",
+  "alembic>=1.13",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+  "ruff>=0.6.0",
+  "mypy>=1.8.0",
+]
+
+[project.scripts]
+tbssa = "tbssa.__main__:main"
+tbssa-seed = "tbssa.scripts.seed:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

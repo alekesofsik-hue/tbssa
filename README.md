@@ -1,61 +1,109 @@
-## tbssa — Telegram Bot Server Supervisor Assistant
+# tbssa — Telegram Bot Server Supervisor Assistant
 
-Мини-бот для мониторинга и управления Windows-сервером:
-- `/status` — проверка доступности через ICMP ping с VPS
-- `/reboot` — перезагрузка (с подтверждением)
-- `/sos` — жёсткое выключение (с подтверждением)
-- `/me` — показать `chat_id`/`user_id`
+Мини-бот для мониторинга и управления Windows-сервером по SSH (например через Tailscale).
 
-### Требования
+## Возможности
 
-- Python **3.12+**
-- Доступ по SSH до Windows (например через Tailscale)
-- Настроенный `known_hosts` (или pinned fingerprint)
+| Команда  | Описание                                   |
+|----------|--------------------------------------------|
+| `/start` | Приветствие и список команд                |
+| `/my`    | Показать свой ID (для сообщения владельцу) |
+| `/status`| Проверка доступности сервера (ICMP ping)   |
+| `/reboot`| Перезагрузка сервера (с подтверждением)    |
+| `/sos`   | Жёсткое выключение (с подтверждением)      |
 
-### Быстрый старт (локально/на VPS)
+Админ-команды (`/status`, `/reboot`, `/sos`) доступны только пользователям из `ADMIN_IDS`.
 
-Установка **без виртуального окружения** (рекомендуется `pipx`, чтобы не засорять системный Python):
+## Требования
+
+- Python 3.12+
+- SSH-доступ к Windows (OpenSSH, например через Tailscale)
+- `known_hosts` или pinning fingerprint для проверки host key
+
+## Быстрый старт
+
+### 1. Установка
+
+**Через pip (системный или пользовательский):**
 
 ```bash
-cd /home/ezovskikh_a/apps/tbssa
-python3 -m pip install --user pipx
-python3 -m pipx ensurepath
-pipx install -e .
+cd /path/to/tbssa
+pip install -e .
 ```
 
-Создать `.env`:
+**Через pipx (без venv, изолированно):**
+
+```bash
+pip install --user pipx && pipx ensurepath
+pipx install -e /path/to/tbssa
+```
+
+### 2. Конфигурация
 
 ```bash
 cp tbssa.env.example .env
 chmod 600 .env
+# Отредактируйте .env — TELEGRAM_BOT_TOKEN, ADMIN_IDS, SSH_HOST, PING_HOST и т.д.
 ```
 
-Добавить host key в `known_hosts` (рекомендуется):
+### 3. SSH host key
+
+Добавьте хост в `known_hosts`:
 
 ```bash
 ssh-keyscan -H <SSH_HOST> >> ~/.ssh/known_hosts
 ```
 
-Запуск:
+Либо укажите `SSH_HOST_KEY_FINGERPRINT` в `.env` (MD5, формат `aa:bb:cc:...`).
+
+### 4. Запуск
 
 ```bash
 python3 -m tbssa
 ```
 
-### Деплой через systemd
+Или после установки: `tbssa`
 
-1) Отредактировать `tbssa.service` под своё окружение (путь/пользователь/EnvironmentFile).
+## Деплой через systemd
 
-2) Установить unit:
+1. Отредактируйте `tbssa.service` под своё окружение (User, WorkingDirectory, EnvironmentFile, ReadOnlyPaths).
+
+2. Установите unit:
 
 ```bash
-sudo cp /home/ezovskikh_a/apps/tbssa/tbssa.service /etc/systemd/system/tbssa.service
+sudo cp tbssa.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now tbssa
+sudo systemctl status tbssa
 ```
 
-### Безопасность
+## Архитектура
 
-- **Обязательно** задайте `ADMIN_IDS`. Если он пуст — админ-команды будут заблокированы (fail-closed).
-- Рекомендуется проверка SSH host key через `~/.ssh/known_hosts` либо через `SSH_HOST_KEY_FINGERPRINT`.
+```
+tbssa/
+├── bot.py              # Совместимый entrypoint (python bot.py)
+├── src/tbssa/
+│   ├── __main__.py     # Точка входа python -m tbssa
+│   ├── app.py          # Сборка Telegram Application
+│   ├── handlers.py     # Обработчики команд
+│   ├── ssh.py          # SSH + PowerShell, host key policy
+│   ├── ping.py         # ICMP ping
+│   ├── settings.py     # Конфигурация (pydantic-settings)
+│   └── logging_setup.py
+├── tests/
+├── deploy/systemd/     # Шаблон systemd unit
+├── pyproject.toml
+├── requirements.txt
+└── tbssa.env.example
+```
 
+## Безопасность
+
+- **ADMIN_IDS обязателен.** Если пуст — админ-команды запрещены (fail-closed).
+- Проверка SSH host key: `known_hosts` или `SSH_HOST_KEY_FINGERPRINT`.
+- Опасные команды требуют подтверждения кодом.
+- Не коммитьте `.env` — он в `.gitignore`.
+
+## Лицензия
+
+MIT
