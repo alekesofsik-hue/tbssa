@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tbssa"
 version = "0.1.0"
-description = "Telegram Bot — Server Supervisor Assistant (мониторинг и управление Windows-сервером)"
+description = "Server Supervisor Assistant with Telegram and MAX admin runtimes for monitoring and managing Windows servers"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.12"

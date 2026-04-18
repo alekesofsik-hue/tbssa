@@ -1,4 +1,8 @@
-# tbssa dependencies (pinned)
-python-telegram-bot==20.8
+# Runtime dependency mirror for environments that still use pip -r.
+# The canonical dependency source remains pyproject.toml.
+python-telegram-bot[job-queue]==20.8
 paramiko==3.4.0
 pydantic-settings==2.11.0
+sqlalchemy>=2.0
+aiosqlite>=0.20
+alembic>=1.13

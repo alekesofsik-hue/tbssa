@@ -6,6 +6,8 @@ from telegram.ext import ContextTypes, MessageHandler, filters
 
 from tbssa.admin.audit import log_action
 from tbssa.admin.guard import _svc
+from tbssa.notifier import notify_admins
+from tbssa.shared_actions import broadcast_text
 from tbssa.admin.users import sync_admin_from_telegram
 from tbssa.db.engine import AsyncSessionLocal
 
@@ -40,17 +42,9 @@ async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not text:
         return
 
-    who = f"@{uname}" if uname else f"id:{uid}"
-    full_text = f"📢 <b>Сообщение от {who}:</b>\n\n{text}"
-
-    sent = 0
-    failed = 0
-    for admin_id in svc.get_admin_ids():
-        try:
-            await context.bot.send_message(admin_id, full_text, parse_mode=ParseMode.HTML)
-            sent += 1
-        except Exception:
-            failed += 1
+    full_text = broadcast_text(uid, uname, "telegram", text)
+    settings = context.bot_data["settings"]
+    sent, failed = await notify_admins(settings, svc, full_text)
 
     async with AsyncSessionLocal() as session:
         await log_action(session, uid, uname, "broadcast", f"sent={sent} failed={failed}")

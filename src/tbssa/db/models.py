@@ -14,15 +14,21 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    telegram_id: Mapped[int] = mapped_column(Integer, unique=True, nullable=False, index=True)
+    telegram_id: Mapped[int | None] = mapped_column(Integer, unique=True, nullable=True, index=True)
     username: Mapped[str | None] = mapped_column(String(64), nullable=True)  # @username из Telegram, автообновляется
     first_name: Mapped[str | None] = mapped_column(String(128), nullable=True)  # first_name из Telegram
+    max_user_id: Mapped[int | None] = mapped_column(Integer, unique=True, nullable=True, index=True)
+    max_username: Mapped[str | None] = mapped_column(String(64), nullable=True)  # username из MAX
+    max_first_name: Mapped[str | None] = mapped_column(String(128), nullable=True)  # first_name из MAX
     display_name: Mapped[str | None] = mapped_column(String(128), nullable=True)  # Реальное имя, вводится вручную
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
     def __repr__(self) -> str:
-        return f"<User telegram_id={self.telegram_id} username={self.username}>"
+        return (
+            f"<User telegram_id={self.telegram_id} max_user_id={self.max_user_id} "
+            f"username={self.username}>"
+        )
 
 
 class Server(Base):
@@ -66,11 +72,12 @@ class AuditLog(Base):
     __tablename__ = "audit_log"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    telegram_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    actor_id: Mapped[int] = mapped_column("telegram_id", Integer, nullable=False, index=True)
+    platform: Mapped[str] = mapped_column(String(16), nullable=False, default="telegram", server_default="telegram")
     username: Mapped[str | None] = mapped_column(String(64), nullable=True)
     action: Mapped[str] = mapped_column(String(128), nullable=False)
     details: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
     def __repr__(self) -> str:
-        return f"<AuditLog telegram_id={self.telegram_id} action={self.action}>"
+        return f"<AuditLog platform={self.platform} actor_id={self.actor_id} action={self.action}>"

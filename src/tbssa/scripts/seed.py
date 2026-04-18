@@ -20,10 +20,11 @@ from tbssa.settings import Settings, parse_admin_ids
 
 async def _seed() -> None:
     settings = Settings()
-    admin_ids = parse_admin_ids(settings.ADMIN_IDS)
+    telegram_admin_ids = parse_admin_ids(settings.ADMIN_IDS)
+    max_admin_ids = parse_admin_ids(settings.MAX_ADMIN_IDS)
 
-    if not admin_ids and not settings.SSH_HOST.strip():
-        print("Ошибка: для bootstrap нужны ADMIN_IDS и SSH_HOST в .env.")
+    if not telegram_admin_ids and not max_admin_ids and not settings.SSH_HOST.strip():
+        print("Ошибка: для bootstrap нужны ADMIN_IDS/MAX_ADMIN_IDS и SSH_HOST в .env.")
         print("После заполнения запустите: tbssa-seed")
         raise SystemExit(1)
 
@@ -31,7 +32,7 @@ async def _seed() -> None:
 
     async with AsyncSessionLocal() as session:
         # --- Users ---
-        for tid in admin_ids:
+        for tid in telegram_admin_ids:
             stmt = (
                 sqlite_insert(User)
                 .values(telegram_id=tid, username=None, first_name=None, is_active=True)
@@ -41,7 +42,20 @@ async def _seed() -> None:
                 )
             )
             await session.execute(stmt)
-        print(f"  users:   seeded {len(admin_ids)} admin(s)")
+        for max_uid in max_admin_ids:
+            stmt = (
+                sqlite_insert(User)
+                .values(max_user_id=max_uid, max_username=None, max_first_name=None, is_active=True)
+                .on_conflict_do_update(
+                    index_elements=["max_user_id"],
+                    set_={"is_active": True},
+                )
+            )
+            await session.execute(stmt)
+        print(
+            f"  users:   seeded {len(telegram_admin_ids)} Telegram admin(s), "
+            f"{len(max_admin_ids)} MAX admin(s)"
+        )
 
         # --- Server (skip if no SSH_HOST — bootstrap not run) ---
         if not settings.SSH_HOST.strip():

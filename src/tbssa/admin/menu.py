@@ -2,6 +2,15 @@ from __future__ import annotations
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+from tbssa.ui_text import (
+    ADMIN_HOME_TEXT,
+    BUTTON_AUDIT,
+    BUTTON_MAIN_MENU,
+    BUTTON_SERVERS,
+    BUTTON_SETTINGS,
+    BUTTON_USERS,
+)
+
 # All admin callback_data is namespaced with "adm:" to avoid collisions.
 
 # ── Top-level sections ────────────────────────────────────────────────────────
@@ -16,12 +25,12 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🖥 Серверы", callback_data=ADM_SERVERS),
-                InlineKeyboardButton("👥 Пользователи", callback_data=ADM_USERS),
+                InlineKeyboardButton(BUTTON_SERVERS, callback_data=ADM_SERVERS),
+                InlineKeyboardButton(BUTTON_USERS, callback_data=ADM_USERS),
             ],
             [
-                InlineKeyboardButton("⚙️ Настройки", callback_data=ADM_SETTINGS),
-                InlineKeyboardButton("📋 Журнал", callback_data=ADM_AUDIT),
+                InlineKeyboardButton(BUTTON_SETTINGS, callback_data=ADM_SETTINGS),
+                InlineKeyboardButton(BUTTON_AUDIT, callback_data=ADM_AUDIT),
             ],
         ]
     )
@@ -29,8 +38,8 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
 
 def back_to_main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("◀️ Главное меню", callback_data=ADM_HOME)]]
+        [[InlineKeyboardButton(BUTTON_MAIN_MENU, callback_data=ADM_HOME)]]
     )
 
 
-MAIN_MENU_TEXT = "🛠 <b>Панель управления</b>\n\nВыберите раздел:"
+MAIN_MENU_TEXT = ADMIN_HOME_TEXT

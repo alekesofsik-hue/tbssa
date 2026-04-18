@@ -5,6 +5,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import CallbackQueryHandler, ContextTypes
 
+from tbssa.audit_view import format_audit_row
 from tbssa.admin.menu import ADM_HOME
 from tbssa.db.engine import AsyncSessionLocal
 from tbssa.db.models import AuditLog
@@ -13,42 +14,6 @@ from tbssa.db.models import AuditLog
 _PAGE_SIZE = 10
 
 _JRN_PAGE = "adm:jrn:page:{offset}"  # show page starting at offset
-
-# ── Emoji map for known action prefixes ───────────────────────────────────────
-_ACTION_ICONS: list[tuple[str, str]] = [
-    ("reboot", "🔄"),
-    ("sos", "🆘"),
-    ("status", "📡"),
-    ("user:add", "👤➕"),
-    ("user:deactivate", "👤🚫"),
-    ("user:reactivate", "👤✅"),
-    ("user:activate", "👤✅"),
-    ("server:add", "🖥➕"),
-    ("server:delete", "🖥🗑"),
-    ("server:toggle", "🖥🔀"),
-    ("server:edit", "🖥✏️"),
-    ("config:set", "⚙️✏️"),
-    ("open:admin", "👁"),
-]
-
-
-def _icon(action: str) -> str:
-    for prefix, icon in _ACTION_ICONS:
-        if action.startswith(prefix):
-            return icon
-    return "•"
-
-
-# ── Format a single log row ────────────────────────────────────────────────────
-
-
-def _fmt_row(entry: AuditLog) -> str:
-    ts = entry.created_at.strftime("%d.%m %H:%M")
-    who = f"@{entry.username}" if entry.username else f"id:{entry.telegram_id}"
-    icon = _icon(entry.action)
-    action = entry.action
-    details = f" {entry.details}" if entry.details else ""
-    return f"<code>{ts}</code>  {who}\n{icon} <b>{action}</b>{details}"
 
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
@@ -97,7 +62,7 @@ async def _render_page(offset: int) -> tuple[str, int]:
     header = f"📋 <b>Журнал действий</b>  <i>(стр. {page_num}/{page_max}, всего: {total})</i>\n"
     rows = [header, "─" * 32]
     for entry in entries:
-        rows.append(_fmt_row(entry))
+        rows.append(format_audit_row(entry))
     return "\n".join(rows), total
 
 

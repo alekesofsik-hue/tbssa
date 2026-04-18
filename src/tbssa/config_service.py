@@ -2,13 +2,22 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import TypeAlias
 
 from sqlalchemy import select
 
+from tbssa.config_meta import CONFIG_DEFAULTS
 from tbssa.db.engine import AsyncSessionLocal
 from tbssa.db.models import AuditLog, Config, Server, User
 
 log = logging.getLogger("tbssa")
+
+LoadSignature: TypeAlias = tuple[
+    tuple[int, ...],
+    tuple[int, ...],
+    tuple[int, ...],
+    tuple[tuple[str, str], ...],
+]
 
 
 @dataclass
@@ -27,26 +36,6 @@ class ServerConfig:
     ping_timeout: int
 
 
-# Keys stored in the config table with their defaults.
-_CONFIG_DEFAULTS: dict[str, str] = {
-    "CONFIRM_TTL_SECONDS": "60",
-    "PING_COUNT": "3",
-    "PING_TIMEOUT": "1",
-    "SSH_CONNECT_TIMEOUT": "8",
-    "SSH_COMMAND_TIMEOUT": "15",
-    "SSH_DEFAULT_USER": "bot-admin",
-    "SSH_DEFAULT_KEY_PATH": "~/.ssh/id_ed25519_bot",
-    "SSH_CMD_POWEROFF": "shutdown /p /f",
-    "SSH_CMD_REBOOT": "shutdown /r /t 0 /f",
-    "PING_CMD_TEMPLATE": "ping -c 1 -n -w {timeout} {host}",
-    "PING_CHECK_INTERVAL_MINUTES": "5",
-    "REACHABILITY_ALERT_COOLDOWN_MINUTES": "60",
-    "SOS_BUTTON_LABEL": "SOS",
-    "SOS_REQUIRE_CONFIRM": "0",
-    "SOS_MSG_HEADER": "SOS выполнен",
-}
-
-
 class ConfigService:
     """
     In-memory cache for servers, admin user IDs, and global config values.
@@ -54,10 +43,12 @@ class ConfigService:
     """
 
     def __init__(self) -> None:
-        self._admin_ids: set[int] = set()
+        self._telegram_admin_ids: set[int] = set()
+        self._max_admin_ids: set[int] = set()
         self._servers: list[ServerConfig] = []
-        self._config: dict[str, str] = dict(_CONFIG_DEFAULTS)
+        self._config: dict[str, str] = dict(CONFIG_DEFAULTS)
         self._ready: bool = False
+        self._last_load_signature: LoadSignature | None = None
 
     # ------------------------------------------------------------------
     # Load / reload
@@ -69,16 +60,21 @@ class ConfigService:
             servers = (await session.execute(select(Server).where(Server.is_active == True))).scalars().all()  # noqa: E712
             configs = (await session.execute(select(Config))).scalars().all()
 
-        self._admin_ids = {u.telegram_id for u in users}
-        self._servers = [self._to_server_config(s) for s in servers]
-        cfg = dict(_CONFIG_DEFAULTS)
+        cfg = dict(CONFIG_DEFAULTS)
         for row in configs:
             cfg[row.key] = row.value
         self._config = cfg
+        self._telegram_admin_ids = {u.telegram_id for u in users if u.telegram_id is not None}
+        self._max_admin_ids = {u.max_user_id for u in users if u.max_user_id is not None}
+        self._servers = [self._to_server_config(s) for s in servers]
         self._ready = True
-        log.info(
-            f"[config_service] loaded: {len(self._admin_ids)} admin(s), "
-            f"{len(self._servers)} server(s), {len(self._config)} config key(s)"
+        self._log_load_summary(
+            self._build_load_signature(
+                telegram_admin_ids=self._telegram_admin_ids,
+                max_admin_ids=self._max_admin_ids,
+                server_ids={s.id for s in servers},
+                config_values=self._config,
+            )
         )
 
     async def reload(self) -> None:
@@ -94,9 +90,14 @@ class ConfigService:
         return self._ready
 
     def is_admin(self, telegram_id: int | None) -> bool:
-        if not self._admin_ids or telegram_id is None:
+        if not self._telegram_admin_ids or telegram_id is None:
             return False
-        return telegram_id in self._admin_ids
+        return telegram_id in self._telegram_admin_ids
+
+    def is_max_admin(self, max_user_id: int | None) -> bool:
+        if not self._max_admin_ids or max_user_id is None:
+            return False
+        return max_user_id in self._max_admin_ids
 
     def get_servers(self) -> list[ServerConfig]:
         return list(self._servers)
@@ -114,7 +115,10 @@ class ConfigService:
         return self._config.get(key, default)
 
     def get_admin_ids(self) -> list[int]:
-        return list(self._admin_ids)
+        return list(self._telegram_admin_ids)
+
+    def get_max_admin_ids(self) -> list[int]:
+        return list(self._max_admin_ids)
 
     def get_int(self, key: str, default: int = 0) -> int:
         try:
@@ -131,15 +135,17 @@ class ConfigService:
 
     async def write_audit(
         self,
-        telegram_id: int,
+        actor_id: int,
         username: str | None,
         action: str,
         details: str | None = None,
+        platform: str = "telegram",
     ) -> None:
         async with AsyncSessionLocal() as session:
             session.add(
                 AuditLog(
-                    telegram_id=telegram_id,
+                    actor_id=actor_id,
+                    platform=platform,
                     username=username,
                     action=action,
                     details=details,
@@ -167,4 +173,35 @@ class ConfigService:
             ping_host=s.ssh_host,  # один адрес для SSH и проверки доступности
             ping_count=s.ping_count,
             ping_timeout=s.ping_timeout,
+        )
+
+    def _build_load_signature(
+        self,
+        *,
+        telegram_admin_ids: set[int],
+        max_admin_ids: set[int],
+        server_ids: set[int],
+        config_values: dict[str, str],
+    ) -> LoadSignature:
+        return (
+            tuple(sorted(telegram_admin_ids)),
+            tuple(sorted(max_admin_ids)),
+            tuple(sorted(server_ids)),
+            tuple(sorted(config_values.items())),
+        )
+
+    def _log_load_summary(self, signature: LoadSignature) -> None:
+        if self._last_load_signature == signature:
+            return
+
+        verb = "loaded" if self._last_load_signature is None else "reloaded"
+        self._last_load_signature = signature
+        tg_ids, max_ids, server_ids, config_items = signature
+        log.info(
+            "[config_service] %s: %s telegram admin(s), %s max admin(s), %s server(s), %s config key(s)",
+            verb,
+            len(tg_ids),
+            len(max_ids),
+            len(server_ids),
+            len(config_items),
         )

@@ -10,6 +10,7 @@ from tbssa.app import build_app
 from tbssa.config_service import ConfigService
 from tbssa.db.engine import init_db
 from tbssa.logging_setup import setup_logging
+from tbssa.max_runtime import MaxBotRuntime
 from tbssa.settings import Settings
 
 
@@ -29,6 +30,8 @@ def main() -> None:
     asyncio.set_event_loop(loop)
 
     config_service = loop.run_until_complete(_init())
+    max_runtime = MaxBotRuntime(settings)
+    max_runtime.start_background()
 
     if not config_service.get_servers():
         log.critical("[tbssa] No active servers in DB — run: tbssa-seed")

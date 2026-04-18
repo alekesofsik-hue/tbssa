@@ -1,108 +1,91 @@
-# tbssa — Telegram Bot Server Supervisor Assistant
+# tbssa
 
-Мини-бот для мониторинга и управления Windows-сервером по SSH (например через Tailscale).
+`tbssa` — бот для мониторинга и администрирования Windows-серверов по SSH с двумя transport-слоями: Telegram и MAX.
 
-## Возможности
+Проект уже работает не как “минимальный Telegram-бот”, а как единый operational-контур с общей базой данных, журналом, настройками, уведомлениями и admin UI в обоих мессенджерах.
 
-| Команда  | Описание                                   |
-|----------|--------------------------------------------|
-| `/start` | Приветствие и список команд                |
-| `/my`    | Показать свой ID (для сообщения владельцу) |
-| `/status`| Проверка доступности сервера (ICMP ping)   |
-| `/reboot`| Перезагрузка сервера (с подтверждением)    |
-| `/sos`   | Жёсткое выключение (с подтверждением)      |
+## Что умеет сейчас
 
-Админ-команды (`/status`, `/reboot`, `/sos`) доступны только пользователям из `ADMIN_IDS`.
+Публичные сценарии:
 
-## Требования
+- `/start`
+- `/my`
 
-- Python 3.12+
-- SSH-доступ к Windows (OpenSSH, например через Tailscale)
-- `known_hosts` или pinning fingerprint для проверки host key
+Административные сценарии:
+
+- `/admin`
+- `/status`
+- `/reboot`
+- `/sos`
+- admin broadcast
+- мониторинговые алерты
+- журнал действий
+- управление серверами
+- управление пользователями
+- изменение runtime-настроек без перезапуска
+
+Критичный паритет MAX относительно Telegram достигнут.
 
 ## Быстрый старт
 
-### 1. Установка
-
-**Через pip (системный или пользовательский):**
-
 ```bash
-cd /path/to/tbssa
-pip install -e .
-```
-
-**Через pipx (без venv, изолированно):**
-
-```bash
-pip install --user pipx && pipx ensurepath
-pipx install -e /path/to/tbssa
-```
-
-### 2. Конфигурация
-
-```bash
+python -m venv .venv
+. .venv/bin/activate
+pip install -e ".[dev]"
 cp tbssa.env.example .env
 chmod 600 .env
-# Отредактируйте .env — TELEGRAM_BOT_TOKEN, ADMIN_IDS, SSH_HOST, PING_HOST и т.д.
+alembic upgrade head
+tbssa-seed
+python -m tbssa
 ```
 
-### 3. SSH host key
+Минимум для первого запуска:
 
-Добавьте хост в `known_hosts`:
+- `TELEGRAM_BOT_TOKEN`
+- `ADMIN_IDS` и/или `MAX_ADMIN_IDS`
+- SSH/ping bootstrap-поля в `.env`
 
-```bash
-ssh-keyscan -H <SSH_HOST> >> ~/.ssh/known_hosts
-```
+`MAX_BOT_TOKEN` включает MAX runtime. После первичного bootstrap рабочая конфигурация редактируется уже через admin UI и хранится в базе данных.
 
-Либо укажите `SSH_HOST_KEY_FINGERPRINT` в `.env` (MD5, формат `aa:bb:cc:...`).
+## Карта документации
 
-### 4. Запуск
+- [Документация](docs/README.md)
+- [Локальный запуск](docs/setup.md)
+- [Развёртывание](docs/deployment.md)
+- [Чек-лист ручного тестирования](docs/manual-test-checklist.md)
+- [Безопасность](SECURITY.md)
+- [OpenSSH на Windows](SSH_SETUP.md)
+- [NetBird](NETBIRD_SETUP.md)
+- [История MAX parity](docs/history/max-parity-roadmap.md)
+- [История Telegram admin UI](docs/history/telegram-admin-roadmap.md)
 
-```bash
-python3 -m tbssa
-```
+## Структура проекта
 
-Или после установки: `tbssa`
-
-## Деплой через systemd
-
-1. Отредактируйте `tbssa.service` под своё окружение (User, WorkingDirectory, EnvironmentFile, ReadOnlyPaths).
-
-2. Установите unit:
-
-```bash
-sudo cp tbssa.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now tbssa
-sudo systemctl status tbssa
-```
-
-## Архитектура
-
-```
+```text
 tbssa/
-├── bot.py              # Совместимый entrypoint (python bot.py)
-├── src/tbssa/
-│   ├── __main__.py     # Точка входа python -m tbssa
-│   ├── app.py          # Сборка Telegram Application
-│   ├── handlers.py     # Обработчики команд
-│   ├── ssh.py          # SSH + PowerShell, host key policy
-│   ├── ping.py         # ICMP ping
-│   ├── settings.py     # Конфигурация (pydantic-settings)
-│   └── logging_setup.py
-├── tests/
-├── deploy/systemd/     # Шаблон systemd unit
+├── src/tbssa/          # runtime, Telegram/MAX handlers, shared business logic
+├── tests/              # точечные unit-тесты
+├── alembic/            # миграции БД
+├── docs/               # актуальная проектная документация
+├── deploy/systemd/     # переносимый шаблон systemd unit
+├── bot.py              # совместимый entrypoint
 ├── pyproject.toml
 ├── requirements.txt
 └── tbssa.env.example
 ```
 
+## Развёртывание
+
+Канонический шаблон `systemd`-unit находится в `deploy/systemd/tbssa.service`.
+
+Файл `tbssa.service` в корне проекта считается локальным примером уже настроенного окружения и не должен восприниматься как переносимый шаблон без проверки путей и пользователя.
+
 ## Безопасность
 
-- **ADMIN_IDS обязателен.** Если пуст — админ-команды запрещены (fail-closed).
-- Проверка SSH host key: `known_hosts` или `SSH_HOST_KEY_FINGERPRINT`.
-- Опасные команды требуют подтверждения кодом.
-- Не коммитьте `.env` — он в `.gitignore`.
+- Секреты хранятся только в `.env`.
+- Проверка SSH host key обязательна: `known_hosts` или `SSH_HOST_KEY_FINGERPRINT`.
+- Административный доступ работает по fail-closed модели.
+- Опасные операции требуют явного подтверждения.
 
 ## Лицензия
 

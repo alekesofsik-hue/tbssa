@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime
 from functools import wraps
 from typing import Awaitable, Callable, TypeVar
 
@@ -11,25 +10,26 @@ from telegram.constants import ParseMode
 from telegram.ext import CallbackQueryHandler, ContextTypes
 
 from tbssa.config_service import ConfigService, ServerConfig
+from tbssa.notifier import notify_admins
+from tbssa.shared_actions import execute_sos_all, guest_start_text, sos_progress_text
 from tbssa.ssh import ps, ssh_exec
+from tbssa.ui_text import (
+    ADMIN_ACCESS_DENIED_TEXT,
+    ADMIN_QUICK_ACTIONS_TEXT,
+    BOT_INITIALIZING_TEXT,
+    BUTTON_CANCEL,
+    BUTTON_CONFIRM,
+    my_id_text,
+    sos_confirm_text,
+)
 
 T = TypeVar("T")
-
-_RU_MONTHS = [
-    "", "января", "февраля", "марта", "апреля", "мая", "июня",
-    "июля", "августа", "сентября", "октября", "ноября", "декабря",
-]
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
 def _svc(context: ContextTypes.DEFAULT_TYPE) -> ConfigService:
     return context.bot_data["config_service"]
-
-
-def _fmt_date(dt: datetime) -> str:
-    return f"{dt.day} {_RU_MONTHS[dt.month]} {dt.year} г."
 
 
 # ── Guard decorator ───────────────────────────────────────────────────────────
@@ -45,12 +45,12 @@ def admin_required(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable
 
         if not svc.is_ready():
             await update.effective_chat.send_message(
-                "⛔ Бот ещё не готов. Попробуйте через несколько секунд."
+                BOT_INITIALIZING_TEXT
             )
             return None
 
         if not svc.is_admin(uid):
-            await update.effective_chat.send_message("⛔ Доступ запрещён.")
+            await update.effective_chat.send_message(ADMIN_ACCESS_DENIED_TEXT)
             return None
 
         return await func(update, context)
@@ -75,8 +75,8 @@ def _admin_start_keyboard(svc: ConfigService) -> InlineKeyboardMarkup:
 def _sos_confirm_keyboard(svc: ConfigService) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✅ Подтвердить", callback_data="start:sos:confirm"),
-            InlineKeyboardButton("❌ Отмена", callback_data="start:sos:cancel"),
+            InlineKeyboardButton(BUTTON_CONFIRM, callback_data="start:sos:confirm"),
+            InlineKeyboardButton(BUTTON_CANCEL, callback_data="start:sos:cancel"),
         ]
     ])
 
@@ -91,23 +91,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if u:
             await sync_admin_from_telegram(uid, u.username, u.first_name)
         await update.message.reply_text(
-            "🛠 Управление",
+            ADMIN_QUICK_ACTIONS_TEXT,
             reply_markup=_admin_start_keyboard(svc),
         )
     else:
-        now = datetime.now()
-        await update.message.reply_text(
-            f"Здравствуйте! Сегодня {_fmt_date(now)}, "
-            f"текущее время {now.strftime('%H:%M')}. До свидания!"
-        )
+        await update.message.reply_text(guest_start_text())
 
 
 async def my_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда /my — показать свой ID незарегистрированному пользователю."""
     uid = update.effective_user.id if update.effective_user else 0
     await update.message.reply_text(
-        f"Ваш ID: <code>{uid}</code>\n\n"
-        "Сообщите его владельцу бота для получения доступа.",
+        my_id_text(uid),
         parse_mode=ParseMode.HTML,
     )
 
@@ -152,47 +147,12 @@ async def _exec_sos_all(
         )
         return
 
-    names = ", ".join(f"<b>{s.name}</b>" for s in servers)
     await edit_fn(
-        f"🆘 <b>SOS — выключаю {len(servers)} сервер(а):</b> {names}…",
+        sos_progress_text(servers),
         parse_mode=ParseMode.HTML,
     )
 
-    poweroff_cmd = ps(svc.get_str("SSH_CMD_POWEROFF", "shutdown /p /f"))
-
-    async def _shutdown_one(s: ServerConfig) -> tuple[str, int, str | None]:
-        try:
-            rc, _, err = await asyncio.to_thread(
-                ssh_exec,
-                host=s.ssh_host,
-                user=s.ssh_user,
-                key_path=s.ssh_key_path,
-                known_hosts_path=s.ssh_known_hosts_path,
-                pinned_fingerprint_md5=s.ssh_fingerprint,
-                connect_timeout=s.ssh_connect_timeout,
-                command_timeout=s.ssh_command_timeout,
-                cmd=poweroff_cmd,
-            )
-            return s.name, rc, err
-        except Exception as exc:
-            return s.name, -1, str(exc)
-
-    results = await asyncio.gather(*[_shutdown_one(s) for s in servers])
-
-    header = svc.get_str("SOS_MSG_HEADER", "SOS выполнен")
-    lines: list[str] = [f"🆘 <b>{header}</b>\n"]
-    for name, rc, err in results:
-        if rc == 0:
-            lines.append(f"🖥 {name}: ✅ команда принята")
-        elif rc == -1:
-            lines.append(f"🖥 {name}: ❌ ошибка: {err}")
-        else:
-            lines.append(f"🖥 {name}: ⚠️ rc={rc}")
-        await svc.write_audit(uid, uname, "sos:all", f"server={name} rc={rc}")
-
-    who = f"@{uname}" if uname else f"id:{uid}"
-    lines.append(f"\nИнициировал: {who}")
-    report = "\n".join(lines)
+    report = await execute_sos_all(svc, uid, uname, actor_platform="telegram")
 
     await edit_fn(
         report,
@@ -200,13 +160,8 @@ async def _exec_sos_all(
         parse_mode=ParseMode.HTML,
     )
 
-    for admin_id in svc.get_admin_ids():
-        if admin_id == uid:
-            continue
-        try:
-            await context.bot.send_message(admin_id, report, parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
+    settings = context.bot_data["settings"]
+    await notify_admins(settings, svc, report, exclude_telegram_user_id=uid)
 
 
 # ── SOS-all callback (from /start button) ─────────────────────────────────────
@@ -221,14 +176,13 @@ async def sos_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     svc = _svc(context)
 
     if not svc.is_ready() or not svc.is_admin(uid):
-        await query.edit_message_text("⛔ Доступ запрещён.")
+        await query.edit_message_text(ADMIN_ACCESS_DENIED_TEXT)
         return
 
     if svc.get_int("SOS_REQUIRE_CONFIRM", 0):
         label = _sos_label(svc)
         await query.edit_message_text(
-            f"⚠️ <b>Вы уверены, что хотите выполнить {label}?</b>\n\n"
-            "Все активные серверы будут немедленно выключены.",
+            sos_confirm_text(label),
             reply_markup=_sos_confirm_keyboard(svc),
             parse_mode=ParseMode.HTML,
         )
@@ -248,7 +202,7 @@ async def sos_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     svc = _svc(context)
 
     if not svc.is_ready() or not svc.is_admin(uid):
-        await query.edit_message_text("⛔ Доступ запрещён.")
+        await query.edit_message_text(ADMIN_ACCESS_DENIED_TEXT)
         return
 
     await _exec_sos_all(update, uid, uname, svc, context)
@@ -263,11 +217,11 @@ async def sos_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     svc = _svc(context)
 
     if not svc.is_ready() or not svc.is_admin(uid):
-        await query.edit_message_text("⛔ Доступ запрещён.")
+        await query.edit_message_text(ADMIN_ACCESS_DENIED_TEXT)
         return
 
     await query.edit_message_text(
-        "🛠 Управление",
+        ADMIN_QUICK_ACTIONS_TEXT,
         reply_markup=_admin_start_keyboard(svc),
     )
 
@@ -292,8 +246,7 @@ async def _trigger_sos_from_message(update: Update, context: ContextTypes.DEFAUL
     if svc.get_int("SOS_REQUIRE_CONFIRM", 0):
         label = _sos_label(svc)
         await update.message.reply_text(
-            f"⚠️ <b>Вы уверены, что хотите выполнить {label}?</b>\n\n"
-            "Все активные серверы будут немедленно выключены.",
+            sos_confirm_text(label),
             reply_markup=_sos_confirm_keyboard(svc),
             parse_mode=ParseMode.HTML,
         )

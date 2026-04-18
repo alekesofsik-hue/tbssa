@@ -11,6 +11,7 @@ from tbssa.admin.servers import get_server_handlers
 from tbssa.admin.settings import get_settings_handlers
 from tbssa.admin.users import get_user_handlers
 from tbssa.config_service import ConfigService
+from tbssa.error_handlers import telegram_error_handler
 from tbssa.handlers import get_server_cmd_handlers, get_start_handlers, my_cmd, sos_cmd, start
 from tbssa.settings import Settings
 
@@ -42,6 +43,7 @@ def build_app(settings: Settings, config_service: ConfigService):
 
     # ConfigService is accessible in all handlers via context.bot_data
     app.bot_data["config_service"] = config_service
+    app.bot_data["settings"] = settings
 
     # ── Public commands ───────────────────────────────────────────────────────
     app.add_handler(CommandHandler("start", start))
@@ -77,5 +79,7 @@ def build_app(settings: Settings, config_service: ConfigService):
     # ── Admin panel: main menu ────────────────────────────────────────────────
     for handler in get_admin_handlers():
         app.add_handler(handler)
+
+    app.add_error_handler(telegram_error_handler)
 
     return app

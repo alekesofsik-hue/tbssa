@@ -22,6 +22,7 @@ from tbssa.admin.servers import show_servers_list
 from tbssa.admin.settings import show_settings
 from tbssa.admin.users import show_users_list, sync_admin_from_telegram
 from tbssa.db.engine import AsyncSessionLocal
+from tbssa.ui_text import ADMIN_ACCESS_DENIED_TEXT, SESSION_EXPIRED_TEXT
 
 # Session timeout: close menu after 5 minutes of inactivity.
 _SESSION_TTL = 5 * 60  # seconds
@@ -70,13 +71,13 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Always re-check access on every callback (fail-closed).
     if not svc.is_ready() or not svc.is_admin(uid):
-        await query.edit_message_text("⛔ Доступ запрещён.")
+        await query.edit_message_text(ADMIN_ACCESS_DENIED_TEXT)
         return
 
     # Session expiry check.
     if _session_expired(context):
         await query.edit_message_text(
-            "⏱ Сессия истекла. Откройте меню заново: /admin",
+            SESSION_EXPIRED_TEXT,
             reply_markup=None,
         )
         context.user_data.pop(_SESSION_KEY, None)

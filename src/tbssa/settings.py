@@ -19,9 +19,14 @@ class Settings(BaseSettings):
     """Runtime settings. Only TELEGRAM_BOT_TOKEN is required after bootstrap."""
 
     TELEGRAM_BOT_TOKEN: str
+    MAX_BOT_TOKEN: str = ""
+    MAX_BASE_URL: str = "https://platform-api.max.ru"
+    MAX_POLL_TIMEOUT: int = 30
+    MAX_POLL_LIMIT: int = 100
 
     # Only needed for tbssa-seed (bootstrap). Ignored at runtime — data comes from DB.
     ADMIN_IDS: str = ""
+    MAX_ADMIN_IDS: str = ""
     SSH_HOST: str = ""
     SSH_USER: str = "bot-admin"
     SSH_KEY_PATH: str = "~/.ssh/id_ed25519_bot"

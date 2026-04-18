@@ -7,6 +7,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from tbssa.config_service import ConfigService
+from tbssa.ui_text import ADMIN_ACCESS_DENIED_TEXT, BOT_INITIALIZING_TEXT
 
 T = TypeVar("T")
 
@@ -29,14 +30,12 @@ def admin_required(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable
 
         if not svc.is_ready():
             if update.effective_chat:
-                await update.effective_chat.send_message(
-                    "⛔ Бот ещё инициализируется. Попробуйте через несколько секунд."
-                )
+                await update.effective_chat.send_message(BOT_INITIALIZING_TEXT)
             return None
 
         if not svc.is_admin(uid):
             if update.effective_chat:
-                await update.effective_chat.send_message("⛔ Доступ запрещён.")
+                await update.effective_chat.send_message(ADMIN_ACCESS_DENIED_TEXT)
             return None
 
         return await func(update, context)

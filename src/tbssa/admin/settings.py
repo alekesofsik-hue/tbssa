@@ -15,119 +15,19 @@ from telegram.ext import (
 from tbssa.admin.audit import log_action
 from tbssa.admin.guard import _svc
 from tbssa.admin.menu import ADM_HOME
+from tbssa.config_meta import CONFIG_DEFAULTS, CONFIG_NUMERIC_KEYS, CONFIG_TEXT_KEYS, merged_config_values
 from tbssa.db.engine import AsyncSessionLocal
 from tbssa.db.models import Config
 
 # ── Metadata for numeric configurable keys ────────────────────────────────────
 # Each entry: (label, description, min_value, max_value)
-_KEYS: dict[str, tuple[str, str, int, int]] = {
-    "CONFIRM_TTL_SECONDS": (
-        "Подтверждение (сек.)",
-        "Время жизни запроса на подтверждение опасной команды",
-        10,
-        600,
-    ),
-    "PING_COUNT": (
-        "Ping: число пакетов",
-        "Количество ICMP-пакетов при проверке доступности",
-        1,
-        20,
-    ),
-    "PING_TIMEOUT": (
-        "Ping: таймаут (сек.)",
-        "Таймаут ожидания каждого пакета",
-        1,
-        30,
-    ),
-    "SSH_CONNECT_TIMEOUT": (
-        "SSH: таймаут подключения (сек.)",
-        "Время ожидания установки SSH-соединения",
-        3,
-        60,
-    ),
-    "SSH_COMMAND_TIMEOUT": (
-        "SSH: таймаут команды (сек.)",
-        "Время ожидания выполнения команды по SSH",
-        5,
-        120,
-    ),
-    "PING_CHECK_INTERVAL_MINUTES": (
-        "Мониторинг: интервал (мин.)",
-        "Как часто бот автоматически проверяет доступность серверов (требуется перезапуск)",
-        1,
-        60,
-    ),
-    "REACHABILITY_ALERT_COOLDOWN_MINUTES": (
-        "Мониторинг: антиспам (мин.)",
-        "Минимальный интервал между повторными уведомлениями о недоступном сервере",
-        5,
-        1440,
-    ),
-    "SOS_REQUIRE_CONFIRM": (
-        "SOS: подтверждение (0/1)",
-        "1 — требовать подтверждение перед выполнением SOS; 0 — выполнять немедленно",
-        0,
-        1,
-    ),
-}
+_KEYS: dict[str, tuple[str, str, int, int]] = CONFIG_NUMERIC_KEYS
 
 # ── Metadata for text configurable keys ───────────────────────────────────────
 # Each entry: (label, description, max_length)
-_TEXT_KEYS: dict[str, tuple[str, str, int]] = {
-    "SOS_BUTTON_LABEL": (
-        "SOS: текст кнопки",
-        "Надпись на красной кнопке в меню /start (только для администраторов)",
-        20,
-    ),
-    "SOS_MSG_HEADER": (
-        "SOS: заголовок отчёта",
-        "Заголовок сообщения, отправляемого админам при выполнении SOS",
-        64,
-    ),
-    "SSH_DEFAULT_USER": (
-        "SSH: пользователь по умолчанию",
-        "Имя пользователя для подключения по SSH ко всем серверам",
-        64,
-    ),
-    "SSH_DEFAULT_KEY_PATH": (
-        "SSH: путь к ключу",
-        "Путь к приватному SSH-ключу для подключения ко всем серверам",
-        512,
-    ),
-    "SSH_CMD_POWEROFF": (
-        "Команда: выключение",
-        "Команда PowerShell для жёсткого выключения сервера (отправляется по SSH)",
-        128,
-    ),
-    "SSH_CMD_REBOOT": (
-        "Команда: перезагрузка",
-        "Команда PowerShell для перезагрузки сервера (отправляется по SSH)",
-        128,
-    ),
-    "PING_CMD_TEMPLATE": (
-        "Проверка статуса: шаблон команды",
-        "Шаблон: {timeout} (сек), {host}. Пример: ping -c 1 -n -w {timeout} {host}",
-        256,
-    ),
-}
+_TEXT_KEYS: dict[str, tuple[str, str, int]] = CONFIG_TEXT_KEYS
 
-_DEFAULTS: dict[str, str] = {
-    "CONFIRM_TTL_SECONDS": "60",
-    "PING_COUNT": "3",
-    "PING_TIMEOUT": "1",
-    "PING_CHECK_INTERVAL_MINUTES": "5",
-    "REACHABILITY_ALERT_COOLDOWN_MINUTES": "60",
-    "SSH_CONNECT_TIMEOUT": "8",
-    "SSH_COMMAND_TIMEOUT": "15",
-    "SOS_REQUIRE_CONFIRM": "0",
-    "SOS_BUTTON_LABEL": "SOS",
-    "SOS_MSG_HEADER": "SOS выполнен",
-    "SSH_DEFAULT_USER": "bot-admin",
-    "SSH_DEFAULT_KEY_PATH": "~/.ssh/id_ed25519_bot",
-    "SSH_CMD_POWEROFF": "shutdown /p /f",
-    "SSH_CMD_REBOOT": "shutdown /r /t 0 /f",
-    "PING_CMD_TEMPLATE": "ping -c 1 -n -w {timeout} {host}",
-}
+_DEFAULTS: dict[str, str] = CONFIG_DEFAULTS
 
 # ── callback_data constants ────────────────────────────────────────────────────
 _CFG_LIST = "adm:cfg:list"
@@ -146,11 +46,7 @@ _CTX_IS_TEXT = "adm:cfg:is_text"
 async def _load_config(session) -> dict[str, str]:
     """Load current values from DB, falling back to defaults."""
     rows = (await session.execute(select(Config))).scalars().all()
-    result = dict(_DEFAULTS)
-    for row in rows:
-        if row.key in result:
-            result[row.key] = row.value
-    return result
+    return merged_config_values(rows)
 
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────

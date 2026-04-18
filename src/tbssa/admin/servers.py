@@ -31,6 +31,7 @@ _SRV_ADD = "adm:srv:add"
 _SRV_EDIT = "adm:srv:edit:{id}"
 _SRV_EDIT_FIELD = "adm:srv:edit:{id}:{field}"
 _SRV_TOGGLE = "adm:srv:toggle:{id}"
+_SRV_LIST_INACTIVE = "adm:srv:list:inactive"
 _SRV_DEL_CONFIRM = "adm:srv:del:{id}"
 _SRV_DEL_YES = "adm:srv:del:{id}:yes"
 _SRV_CHECK = "adm:srv:check:{id}"
@@ -85,13 +86,50 @@ def _reach_icon(s: Server) -> str:
     return "🟢" if s.last_ping_ok else "🟡"  # 🟡 = active but unreachable
 
 
-def _servers_list_keyboard(servers: list[Server]) -> InlineKeyboardMarkup:
+async def _load_servers_split() -> tuple[list[Server], list[Server]]:
+    async with AsyncSessionLocal() as session:
+        servers = (await session.execute(select(Server).order_by(Server.name))).scalars().all()
+    active = [s for s in servers if s.is_active]
+    inactive = [s for s in servers if not s.is_active]
+    return active, inactive
+
+
+def _servers_list_text(*, active_count: int, inactive_count: int, show_inactive: bool) -> str:
+    if show_inactive:
+        text = "🖥 <b>Неактивные серверы</b>"
+        if not inactive_count:
+            text += "\n\n<i>Неактивных серверов пока нет.</i>"
+        else:
+            text += f"\n\nВсего: <b>{inactive_count}</b>"
+        return text
+
+    text = "🖥 <b>Серверы</b>\n\n"
+    text += f"Активные: <b>{active_count}</b>"
+    if inactive_count:
+        text += f"\nНеактивные: <b>{inactive_count}</b>"
+    if not active_count:
+        text += "\n\n<i>Активных серверов пока нет. Нажмите «Добавить».</i>"
+    return text
+
+
+def _servers_list_keyboard(
+    servers: list[Server],
+    *,
+    inactive_count: int = 0,
+    show_inactive: bool = False,
+) -> InlineKeyboardMarkup:
     rows = []
     for s in servers:
         icon = _reach_icon(s)
         rows.append([
             InlineKeyboardButton(f"{icon} {s.name}", callback_data=_SRV_VIEW.format(id=s.id)),
             InlineKeyboardButton("Вкл." if not s.is_active else "Откл.", callback_data=_SRV_TOGGLE.format(id=s.id)),
+        ])
+    if show_inactive:
+        rows.append([InlineKeyboardButton("◀️ Активные серверы", callback_data=_SRV_LIST)])
+    elif inactive_count:
+        rows.append([
+            InlineKeyboardButton(f"📦 Неактивные ({inactive_count})", callback_data=_SRV_LIST_INACTIVE)
         ])
     rows.append([InlineKeyboardButton("➕ Добавить сервер", callback_data=_SRV_ADD)])
     rows.append([InlineKeyboardButton("◀️ Главное меню", callback_data=ADM_HOME)])
@@ -194,18 +232,42 @@ def _server_card_text(
 async def show_servers_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Entry point: called from admin_callback when adm:servers is pressed."""
     query = update.callback_query
-    async with AsyncSessionLocal() as session:
-        servers = (await session.execute(select(Server).order_by(Server.name))).scalars().all()
-
-    text = "🖥 <b>Серверы</b>"
-    if not servers:
-        text += "\n\n<i>Серверов пока нет. Нажмите «Добавить».</i>"
-
+    text, keyboard = _servers_list_payload(await _load_servers_split(), show_inactive=False)
     await query.edit_message_text(
-        text,
-        reply_markup=_servers_list_keyboard(list(servers)),
+        text=text,
+        reply_markup=keyboard,
         parse_mode=ParseMode.HTML,
     )
+
+
+async def show_inactive_servers_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    text, keyboard = _servers_list_payload(await _load_servers_split(), show_inactive=True)
+    await query.edit_message_text(
+        text=text,
+        reply_markup=keyboard,
+        parse_mode=ParseMode.HTML,
+    )
+
+
+def _servers_list_payload(
+    split_servers: tuple[list[Server], list[Server]],
+    *,
+    show_inactive: bool,
+) -> tuple[str, InlineKeyboardMarkup]:
+    active_servers, inactive_servers = split_servers
+    visible_servers = inactive_servers if show_inactive else active_servers
+    text = _servers_list_text(
+        active_count=len(active_servers),
+        inactive_count=len(inactive_servers),
+        show_inactive=show_inactive,
+    )
+    keyboard = _servers_list_keyboard(
+        list(visible_servers),
+        inactive_count=len(inactive_servers),
+        show_inactive=show_inactive,
+    )
+    return text, keyboard
 
 
 # ── View server card ──────────────────────────────────────────────────────────
@@ -244,19 +306,17 @@ async def toggle_server(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await query.answer("Сервер не найден.", show_alert=True)
             return
         server.is_active = not server.is_active
+        is_active = server.is_active
         action = "activate" if server.is_active else "deactivate"
         await log_action(session, uid, uname, f"server:{action}", f"server={server.name}")
         await session.commit()
 
     await _svc(context).reload()
-    await query.answer(f"{'Включён ✅' if server.is_active else 'Отключён 🔴'}")
-
-    # refresh list
-    async with AsyncSessionLocal() as session:
-        servers = (await session.execute(select(Server).order_by(Server.name))).scalars().all()
+    await query.answer(f"{'Включён ✅' if is_active else 'Отключён 🔴'}")
+    text, keyboard = _servers_list_payload(await _load_servers_split(), show_inactive=not is_active)
     await query.edit_message_text(
-        "🖥 <b>Серверы</b>",
-        reply_markup=_servers_list_keyboard(list(servers)),
+        text=text,
+        reply_markup=keyboard,
         parse_mode=ParseMode.HTML,
     )
 
@@ -272,7 +332,7 @@ async def delete_server_confirm(update: Update, context: ContextTypes.DEFAULT_TY
     name = server.name if server else str(server_id)
     await query.edit_message_text(
         f"🗑 Удалить сервер <b>{name}</b>?\n\n"
-        "Сервер будет деактивирован (мягкое удаление). Данные сохранятся.",
+        "Сервер будет <b>полностью удалён</b> из системы. Действие необратимо.",
         reply_markup=_delete_confirm_keyboard(server_id),
         parse_mode=ParseMode.HTML,
     )
@@ -289,18 +349,18 @@ async def delete_server_yes(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if not server:
             await query.answer("Сервер не найден.", show_alert=True)
             return
-        server.is_active = False
-        await log_action(session, uid, uname, "server:delete", f"server={server.name}")
+        was_active = server.is_active
+        server_name = server.name
+        await log_action(session, uid, uname, "server:delete", f"server={server_name}")
+        await session.delete(server)
         await session.commit()
 
     await _svc(context).reload()
-    await query.answer("Сервер удалён.")
-
-    async with AsyncSessionLocal() as session:
-        servers = (await session.execute(select(Server).order_by(Server.name))).scalars().all()
+    await query.answer("Сервер удалён навсегда.")
+    text, keyboard = _servers_list_payload(await _load_servers_split(), show_inactive=not was_active)
     await query.edit_message_text(
-        "🖥 <b>Серверы</b>",
-        reply_markup=_servers_list_keyboard(list(servers)),
+        text=text,
+        reply_markup=keyboard,
         parse_mode=ParseMode.HTML,
     )
 
@@ -792,6 +852,7 @@ def get_server_handlers() -> list:
         add_server_conversation(),
         edit_server_conversation(),
         # Flat callbacks
+        CallbackQueryHandler(show_inactive_servers_list, pattern=r"^adm:srv:list:inactive$"),
         CallbackQueryHandler(show_servers_list, pattern=r"^adm:srv:list$"),
         CallbackQueryHandler(show_server_card, pattern=r"^adm:srv:view:\d+$"),
         CallbackQueryHandler(show_edit_menu, pattern=r"^adm:srv:edit:\d+$"),
