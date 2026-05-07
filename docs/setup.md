@@ -30,10 +30,17 @@ chmod 600 .env
 
 - `TELEGRAM_BOT_TOKEN` — обязателен для запуска Telegram-части.
 - `MAX_BOT_TOKEN` — включает MAX runtime.
+- `MAX_WEBHOOK_URL` — включает webhook-режим MAX в production. Если оставить пустым, MAX использует fallback на long polling.
 - `ADMIN_IDS` и/или `MAX_ADMIN_IDS` — только для первичного bootstrap.
 - `SSH_HOST`, `PING_HOST` и SSH-параметры — только для первичного seed.
 
 После bootstrap основная конфигурация хранится в базе данных и редактируется через admin UI.
+
+Для webhook-режима также доступны:
+
+- `MAX_WEBHOOK_SECRET` — общий секрет для проверки заголовка `X-Max-Bot-Api-Secret`;
+- `MAX_WEBHOOK_BIND_HOST` и `MAX_WEBHOOK_BIND_PORT` — локальный HTTP listener, на который должен проксировать внешний HTTPS endpoint;
+- `MAX_WEBHOOK_SYNC_INTERVAL_SECONDS` — период повторной проверки подписки в MAX API.
 
 ## База данных и миграции
 

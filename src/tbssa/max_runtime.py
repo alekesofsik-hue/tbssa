@@ -6,11 +6,15 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from urllib.parse import urlparse
 
 from sqlalchemy import desc, func, select
 
 from tbssa.admin.audit import log_action
+from tbssa.admin.monitor import (
+    format_confirmed_reachability_report,
+    run_confirmed_reachability_check,
+)
 from tbssa.admin.users import (
     _platform_field_hint,
     _platform_field_label,
@@ -32,8 +36,8 @@ from tbssa.db.engine import AsyncSessionLocal
 from tbssa.db.models import AuditLog, Config, Server, User
 from tbssa.error_handlers import MAX_UI_ERROR_TEXT
 from tbssa.max_api import MaxApiClient, max_callback_button, max_inline_keyboard
+from tbssa.max_webhook import MaxWebhookConfig, MaxWebhookServer
 from tbssa.notifier import notify_admins
-from tbssa.ping import ping_status
 from tbssa.settings import Settings
 from tbssa.shared_actions import broadcast_text, execute_sos_all, guest_start_text
 from tbssa.ssh import ps, ssh_exec
@@ -58,20 +62,21 @@ _PAGE_SIZE = 10
 _SESSION_TTL_SECONDS = 5 * 60
 _MAX_SETTINGS_PAGE_SIZE = 8
 _MAX_USERS_PAGE_SIZE = 8
+_MAX_UPDATE_TYPES = ["message_created", "message_callback", "bot_started", "user_added"]
 
 _MAX_SETTINGS_KEY_ORDER: list[str] = [*CONFIG_NUMERIC_KEYS.keys(), *CONFIG_TEXT_KEYS.keys()]
 _MAX_SETTINGS_SHORT_LABELS: dict[str, str] = {
     "CONFIRM_TTL_SECONDS": "Подтверждение (сек.)",
-    "PING_COUNT": "Ping: пакеты",
-    "PING_TIMEOUT": "Ping: таймаут",
+    "PING_COUNT": "ICMP: пакеты",
+    "PING_TIMEOUT": "ICMP: таймаут",
     "SSH_CONNECT_TIMEOUT": "SSH: подключение",
     "SSH_COMMAND_TIMEOUT": "SSH: команда",
     "PING_CHECK_INTERVAL_MINUTES": "Мониторинг: интервал",
     "REACHABILITY_ALERT_COOLDOWN_MINUTES": "Мониторинг: антиспам",
-    "OFFLINE_CONFIRM_DELAY1_MINUTES": "Недоступность: шаг 1",
-    "OFFLINE_CONFIRM_DELAY2_MINUTES": "Недоступность: шаг 2",
-    "ONLINE_CONFIRM_DELAY1_MINUTES": "Доступность: шаг 1",
-    "ONLINE_CONFIRM_DELAY2_MINUTES": "Доступность: шаг 2",
+    "OFFLINE_CONFIRM_DELAY1_MINUTES": "SSH недоступен: шаг 1",
+    "OFFLINE_CONFIRM_DELAY2_MINUTES": "SSH недоступен: шаг 2",
+    "ONLINE_CONFIRM_DELAY1_MINUTES": "SSH доступен: шаг 1",
+    "ONLINE_CONFIRM_DELAY2_MINUTES": "SSH доступен: шаг 2",
     "SOS_REQUIRE_CONFIRM": "SOS: подтверждение",
     "SOS_BUTTON_LABEL": "SOS: кнопка",
     "SOS_MSG_HEADER": "SOS: заголовок",
@@ -79,7 +84,7 @@ _MAX_SETTINGS_SHORT_LABELS: dict[str, str] = {
     "SSH_DEFAULT_KEY_PATH": "SSH: ключ",
     "SSH_CMD_POWEROFF": "Команда: выключение",
     "SSH_CMD_REBOOT": "Команда: перезагрузка",
-    "PING_CMD_TEMPLATE": "Проверка: команда",
+    "PING_CMD_TEMPLATE": "ICMP: команда",
 }
 
 _HOSTNAME_RE = re.compile(
@@ -102,6 +107,9 @@ class MaxBotRuntime:
         self.client = MaxApiClient(settings.MAX_BOT_TOKEN, settings.MAX_BASE_URL)
         self._thread: threading.Thread | None = None
         self._sessions: dict[int, _MaxSession] = {}
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._svc: ConfigService | None = None
+        self._webhook_server: MaxWebhookServer | None = None
 
     def start_background(self) -> None:
         if not self.client.enabled:
@@ -163,15 +171,24 @@ class MaxBotRuntime:
     async def run_forever(self) -> None:
         svc = ConfigService()
         await svc.load()
-
-        marker = await self._bootstrap_marker()
-        backoff = 3
+        self._svc = svc
+        self._loop = asyncio.get_running_loop()
 
         try:
             me = await self.client.get_me()
             log.info("[max] connected as %s (%s)", me.get("first_name") or me.get("name"), me.get("user_id"))
         except Exception as exc:
             log.warning("[max] failed to fetch bot info: %s", exc)
+
+        webhook_config = self._build_webhook_config()
+        if webhook_config is not None:
+            await self._run_webhook_forever(webhook_config)
+            return
+
+        await self._warn_if_polling_with_active_webhooks()
+
+        marker = await self._bootstrap_marker()
+        backoff = 3
 
         while True:
             try:
@@ -180,7 +197,7 @@ class MaxBotRuntime:
                     marker=marker,
                     timeout=self.settings.MAX_POLL_TIMEOUT,
                     limit=self.settings.MAX_POLL_LIMIT,
-                    types=["message_created", "message_callback", "bot_started", "user_added"],
+                    types=_MAX_UPDATE_TYPES,
                 )
                 marker = page.get("marker", marker)
                 for update in page.get("updates", []):
@@ -193,6 +210,115 @@ class MaxBotRuntime:
                 log.warning("[max] polling error: %s; retry in %ss", exc, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
+
+    def _build_webhook_config(self) -> MaxWebhookConfig | None:
+        public_url = self.settings.MAX_WEBHOOK_URL.strip()
+        if not public_url:
+            return None
+
+        parsed = urlparse(public_url)
+        if parsed.scheme != "https" or not parsed.netloc:
+            log.warning(
+                "[max] invalid MAX_WEBHOOK_URL=%r; expected full https URL, falling back to long polling",
+                public_url,
+            )
+            return None
+
+        path = parsed.path or "/"
+        return MaxWebhookConfig(
+            public_url=public_url,
+            bind_host=self.settings.MAX_WEBHOOK_BIND_HOST,
+            bind_port=self.settings.MAX_WEBHOOK_BIND_PORT,
+            path=path,
+            secret=self.settings.MAX_WEBHOOK_SECRET.strip(),
+        )
+
+    async def _run_webhook_forever(self, config: MaxWebhookConfig) -> None:
+        self._webhook_server = MaxWebhookServer(config, self._accept_webhook_update)
+        self._webhook_server.start()
+
+        backoff = 3
+        while True:
+            try:
+                await self._ensure_webhook_subscription(config)
+                backoff = 3
+                await asyncio.sleep(self.settings.MAX_WEBHOOK_SYNC_INTERVAL_SECONDS)
+            except Exception as exc:
+                log.warning("[max] webhook sync error: %s; retry in %ss", exc, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 300)
+
+    async def _ensure_webhook_subscription(self, config: MaxWebhookConfig) -> None:
+        page = await self.client.list_subscriptions()
+        subscriptions = page.get("subscriptions") or []
+        active_urls = {
+            item.get("url")
+            for item in subscriptions
+            if isinstance(item, dict) and isinstance(item.get("url"), str)
+        }
+        if config.public_url in active_urls:
+            return
+
+        foreign_urls = sorted(url for url in active_urls if url and url != config.public_url)
+        if foreign_urls:
+            log.warning(
+                "[max] other webhook subscriptions are still active and were not removed: %s",
+                ", ".join(foreign_urls),
+            )
+
+        result = await self.client.create_subscription(
+            url=config.public_url,
+            update_types=_MAX_UPDATE_TYPES,
+            secret=config.secret or None,
+        )
+        if result.get("success") is False:
+            raise RuntimeError(result.get("message") or "MAX rejected webhook subscription")
+        log.info("[max] webhook subscription is active: %s", config.public_url)
+
+    async def _warn_if_polling_with_active_webhooks(self) -> None:
+        try:
+            page = await self.client.list_subscriptions()
+        except Exception as exc:
+            log.warning("[max] failed to inspect webhook subscriptions before polling: %s", exc)
+            return
+
+        subscriptions = page.get("subscriptions") or []
+        active_urls = [
+            item.get("url")
+            for item in subscriptions
+            if isinstance(item, dict) and isinstance(item.get("url"), str)
+        ]
+        if active_urls:
+            log.warning(
+                "[max] webhook subscriptions are active; MAX long polling may not receive events until they are removed: %s",
+                ", ".join(sorted(active_urls)),
+            )
+
+    def _accept_webhook_update(self, update: dict) -> bool:
+        if self._loop is None or self._svc is None:
+            return False
+        try:
+            future = asyncio.run_coroutine_threadsafe(self._process_webhook_update(update), self._loop)
+        except RuntimeError:
+            return False
+        future.add_done_callback(self._log_webhook_task_result)
+        return True
+
+    def _log_webhook_task_result(self, future: object) -> None:
+        try:
+            future.result()
+        except Exception:
+            log.exception("[max] webhook task failed")
+
+    async def _process_webhook_update(self, update: dict) -> None:
+        svc = self._svc
+        if svc is None:
+            return
+        try:
+            await svc.reload()
+            await self._handle_update(svc, update)
+        except Exception as exc:
+            await self._handle_update_exception(update, exc)
 
     async def _bootstrap_marker(self) -> int | None:
         try:
@@ -1605,11 +1731,11 @@ def _reach_icon(server: Server) -> str:
 
 def _reach_text(server: Server) -> str:
     if server.last_ping_ok is None:
-        return "⚪ Не проверялся"
+        return "⚪ не подтверждался"
     ts = server.last_ping_at.strftime("%d.%m %H:%M") if server.last_ping_at else "—"
     if server.last_ping_ok:
-        return f"🟢 Онлайн ({ts})"
-    return f"🔴 Недоступен ({ts})"
+        return f"🟢 доступен ({ts})"
+    return f"🔴 недоступен ({ts})"
 
 
 async def _load_servers_split() -> tuple[list[Server], list[Server]]:
@@ -1664,11 +1790,11 @@ async def _server_card_view(server_id: int, svc: ConfigService) -> tuple[str, li
         f"Known hosts: <code>{server.ssh_known_hosts_path}</code>\n"
         f"Fingerprint: <code>{server.ssh_fingerprint or '—'}</code>\n"
         f"В работе: {'Да ✅' if server.is_active else 'Нет ⛔'}\n"
-        f"Доступность: {_reach_text(server)}"
+        f"Подтверждённый SSH-статус мониторинга: {_reach_text(server)}"
     )
     attachments = max_inline_keyboard([
         [
-            max_callback_button("Проверить", f"max:srv:check:{server_id}"),
+            max_callback_button("Проверить SSH", f"max:srv:check:{server_id}"),
             max_callback_button("Редактировать", f"max:srv:edit:{server_id}"),
         ],
         [
@@ -1752,28 +1878,19 @@ async def _check_server_now(server_id: int, svc: ConfigService) -> tuple[str, li
         server = await session.get(Server, server_id)
         if not server:
             return "⚠️ Сервер не найден.", max_inline_keyboard([[max_callback_button("◀️ Назад", "max:servers")]])
-        ping_host = server.ssh_host
-        ping_count = server.ping_count
-        ping_timeout = server.ping_timeout
+        runtime_server = svc.to_server_config(server)
+        confirmed_ok = server.last_ping_ok
 
     ping_template = svc.get_str("PING_CMD_TEMPLATE", "")
-    template = ping_template if (ping_template and "{timeout}" in ping_template and "{host}" in ping_template) else None
-    try:
-        ok, _ = await asyncio.to_thread(ping_status, ping_host, ping_count, ping_timeout, template)
-        reachable = ok > 0
-    except Exception:
-        reachable = False
-
-    async with AsyncSessionLocal() as session:
-        server = await session.get(Server, server_id)
-        if not server:
-            return "⚠️ Сервер не найден.", max_inline_keyboard([[max_callback_button("◀️ Назад", "max:servers")]])
-        server.last_ping_ok = reachable
-        server.last_ping_at = datetime.utcnow()
-        await session.commit()
-
-    await svc.reload()
-    return await _server_card_view(server_id, svc)
+    report = format_confirmed_reachability_report(
+        await run_confirmed_reachability_check(
+            runtime_server,
+            confirmed_ok=confirmed_ok,
+            ping_template=ping_template,
+        )
+    )
+    text, attachments = await _server_card_view(server_id, svc)
+    return f"{report}\n\n{text}", attachments
 
 
 async def _poweroff_confirm_text(server_id: int) -> str:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-from datetime import datetime
 
 from sqlalchemy import select
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -19,7 +18,10 @@ from telegram.ext import (
 from tbssa.admin.audit import log_action
 from tbssa.admin.guard import _svc
 from tbssa.admin.menu import ADM_HOME, ADM_SERVERS, MAIN_MENU_TEXT, main_menu_keyboard
-from tbssa.ping import ping_status
+from tbssa.admin.monitor import (
+    format_confirmed_reachability_report,
+    run_confirmed_reachability_check,
+)
 from tbssa.ssh import ps, ssh_exec
 from tbssa.db.engine import AsyncSessionLocal
 from tbssa.db.models import Server
@@ -78,12 +80,12 @@ def _valid_path(value: str) -> bool:
 
 
 def _reach_icon(s: Server) -> str:
-    """Icon reflecting reachability of an active server."""
+    """Icon reflecting confirmed SSH availability of an active server."""
     if not s.is_active:
         return "⛔"
     if s.last_ping_ok is None:
-        return "🔵"  # active, not yet checked
-    return "🟢" if s.last_ping_ok else "🟡"  # 🟡 = active but unreachable
+        return "🔵"  # active, SSH state not confirmed yet
+    return "🟢" if s.last_ping_ok else "🟡"  # 🟡 = active, but SSH unavailable
 
 
 async def _load_servers_split() -> tuple[list[Server], list[Server]]:
@@ -139,7 +141,7 @@ def _servers_list_keyboard(
 def _server_card_keyboard(server_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🔍 Проверить сейчас", callback_data=_SRV_CHECK.format(id=server_id)),
+            InlineKeyboardButton("🔍 Проверить SSH", callback_data=_SRV_CHECK.format(id=server_id)),
             InlineKeyboardButton("⚡ Выключить", callback_data=_SRV_POWEROFF.format(id=server_id)),
         ],
         [InlineKeyboardButton("🔄 Перезагрузка", callback_data=_SRV_REBOOT.format(id=server_id))],
@@ -202,11 +204,11 @@ def _reboot_confirm_keyboard(server_id: int) -> InlineKeyboardMarkup:
 
 def _reach_text(s: Server) -> str:
     if s.last_ping_ok is None:
-        return "⚪ Не проверялся"
+        return "⚪ не подтверждался"
     ts = s.last_ping_at.strftime("%d.%m %H:%M") if s.last_ping_at else "—"
     if s.last_ping_ok:
-        return f"🟢 Онлайн ({ts})"
-    return f"🔴 Недоступен ({ts})"
+        return f"🟢 доступен ({ts})"
+    return f"🔴 недоступен ({ts})"
 
 
 def _server_card_text(
@@ -222,7 +224,7 @@ def _server_card_text(
         f"Known hosts: <code>{s.ssh_known_hosts_path}</code>\n"
         f"Fingerprint: <code>{fp}</code>\n"
         f"{in_work}\n"
-        f"Доступность: {_reach_text(s)}"
+        f"Подтверждённый SSH-статус мониторинга: {_reach_text(s)}"
     )
 
 
@@ -797,46 +799,34 @@ def edit_server_conversation() -> ConversationHandler:
 
 async def check_server_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer("🔍 Проверяю…")
+    await query.answer("🔍 Проверяю SSH по логике мониторинга…")
     server_id = int(query.data.split(":")[3])
+    svc = _svc(context)
 
     async with AsyncSessionLocal() as session:
         server = await session.get(Server, server_id)
         if not server:
             await query.edit_message_text("⚠️ Сервер не найден.", reply_markup=None)
             return
+        runtime_server = svc.to_server_config(server)
+        confirmed_ok = server.last_ping_ok
 
-        ping_host = server.ssh_host  # один адрес для SSH и проверки доступности
-        ping_count = server.ping_count
-        ping_timeout = server.ping_timeout
-
-    ping_template = _svc(context).get_str("PING_CMD_TEMPLATE", "")
-    tpl = ping_template if (ping_template and "{timeout}" in ping_template and "{host}" in ping_template) else None
-    try:
-        ok, _ = await asyncio.to_thread(ping_status, ping_host, ping_count, ping_timeout, tpl)
-        reachable = ok > 0
-    except Exception:
-        reachable = False
-
-    now = datetime.utcnow()
-    async with AsyncSessionLocal() as session:
-        server = await session.get(Server, server_id)
-        if not server:
-            return
-        server.last_ping_ok = reachable
-        server.last_ping_at = now
-        await session.commit()
-
-    await _svc(context).reload()
+    ping_template = svc.get_str("PING_CMD_TEMPLATE", "")
+    report = format_confirmed_reachability_report(
+        await run_confirmed_reachability_check(
+            runtime_server,
+            confirmed_ok=confirmed_ok,
+            ping_template=ping_template,
+        )
+    )
 
     async with AsyncSessionLocal() as session:
         server = await session.get(Server, server_id)
 
-    svc = _svc(context)
     ssh_user = svc.get_str("SSH_DEFAULT_USER", "bot-admin")
     ssh_key_path = svc.get_str("SSH_DEFAULT_KEY_PATH", "~/.ssh/id_ed25519_bot")
     await query.edit_message_text(
-        _server_card_text(server, ssh_user, ssh_key_path),
+        f"{report}\n\n{_server_card_text(server, ssh_user, ssh_key_path)}",
         reply_markup=_server_card_keyboard(server_id),
         parse_mode=ParseMode.HTML,
     )

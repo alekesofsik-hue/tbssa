@@ -23,6 +23,31 @@ class MaxApiClient:
     async def get_me(self) -> dict:
         return await asyncio.to_thread(self._request_json, "GET", "/me")
 
+    async def list_subscriptions(self) -> dict:
+        return await asyncio.to_thread(self._request_json, "GET", "/subscriptions")
+
+    async def create_subscription(
+        self,
+        *,
+        url: str,
+        update_types: list[str] | None = None,
+        secret: str | None = None,
+    ) -> dict:
+        body: dict[str, object] = {"url": url}
+        if update_types:
+            body["update_types"] = update_types
+        if secret:
+            body["secret"] = secret
+        return await asyncio.to_thread(self._request_json, "POST", "/subscriptions", body=body)
+
+    async def delete_subscription(self, *, url: str) -> dict:
+        return await asyncio.to_thread(
+            self._request_json,
+            "DELETE",
+            "/subscriptions",
+            params={"url": url},
+        )
+
     async def get_updates(
         self,
         *,

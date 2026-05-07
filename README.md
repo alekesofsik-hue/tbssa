@@ -45,7 +45,7 @@ python -m tbssa
 - `ADMIN_IDS` и/или `MAX_ADMIN_IDS`
 - SSH/ping bootstrap-поля в `.env`
 
-`MAX_BOT_TOKEN` включает MAX runtime. После первичного bootstrap рабочая конфигурация редактируется уже через admin UI и хранится в базе данных.
+`MAX_BOT_TOKEN` включает MAX runtime. Для production рекомендуется заполнить `MAX_WEBHOOK_URL`, чтобы MAX работал через webhook вместо long polling. После первичного bootstrap рабочая конфигурация редактируется уже через admin UI и хранится в базе данных.
 
 ## Карта документации
 
@@ -53,6 +53,7 @@ python -m tbssa
 - [Локальный запуск](docs/setup.md)
 - [Развёртывание](docs/deployment.md)
 - [Чек-лист ручного тестирования](docs/manual-test-checklist.md)
+- [Roadmap стабилизации](docs/stability-roadmap.md)
 - [Безопасность](SECURITY.md)
 - [OpenSSH на Windows](SSH_SETUP.md)
 - [NetBird](NETBIRD_SETUP.md)
@@ -67,7 +68,7 @@ tbssa/
 ├── tests/              # точечные unit-тесты
 ├── alembic/            # миграции БД
 ├── docs/               # актуальная проектная документация
-├── deploy/systemd/     # переносимый шаблон systemd unit
+├── deploy/systemd/     # шаблон systemd unit
 ├── bot.py              # совместимый entrypoint
 ├── pyproject.toml
 ├── requirements.txt
@@ -78,7 +79,7 @@ tbssa/
 
 Канонический шаблон `systemd`-unit находится в `deploy/systemd/tbssa.service`.
 
-Файл `tbssa.service` в корне проекта считается локальным примером уже настроенного окружения и не должен восприниматься как переносимый шаблон без проверки путей и пользователя.
+Локальный unit установлен вне репозитория: `/etc/systemd/system/tbssa.service`. В проекте хранится только шаблон без host-specific значений.
 
 ## Безопасность
 

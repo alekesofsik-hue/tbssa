@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     MAX_BASE_URL: str = "https://platform-api.max.ru"
     MAX_POLL_TIMEOUT: int = 30
     MAX_POLL_LIMIT: int = 100
+    MAX_WEBHOOK_URL: str = ""
+    MAX_WEBHOOK_SECRET: str = ""
+    MAX_WEBHOOK_BIND_HOST: str = "127.0.0.1"
+    MAX_WEBHOOK_BIND_PORT: int = 8081
+    MAX_WEBHOOK_SYNC_INTERVAL_SECONDS: int = 900
 
     # Only needed for tbssa-seed (bootstrap). Ignored at runtime — data comes from DB.
     ADMIN_IDS: str = ""

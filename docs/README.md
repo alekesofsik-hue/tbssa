@@ -5,6 +5,7 @@
 - `setup.md` — локальный запуск, `.env`, миграции и bootstrap.
 - `deployment.md` — production-развёртывание и `systemd`.
 - `manual-test-checklist.md` — printable чек-лист ручного тестирования.
+- `stability-roadmap.md` — короткий backlog полезных улучшений после основного этапа.
 - `history/max-parity-roadmap.md` — завершённая история доведения MAX до паритета.
 - `history/telegram-admin-roadmap.md` — краткая историческая справка по развитию Telegram-admin UI.
 - `../SECURITY.md` — рекомендации по безопасному развёртыванию.

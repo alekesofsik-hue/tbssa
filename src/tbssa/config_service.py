@@ -108,6 +108,9 @@ class ConfigService:
                 return s
         return None
 
+    def to_server_config(self, server: Server) -> ServerConfig:
+        return self._to_server_config(server)
+
     def get_first_server(self) -> ServerConfig | None:
         return self._servers[0] if self._servers else None
 

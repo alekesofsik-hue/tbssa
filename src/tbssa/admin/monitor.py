@@ -41,6 +41,19 @@ class _PendingState:
     token: str = field(default_factory=lambda: secrets.token_hex(4))
 
 
+@dataclass(frozen=True)
+class ConfirmedReachabilityCheck:
+    confirmed_before: bool | None
+    confirmed_after: bool | None
+    icmp_ok: bool
+    ssh_stage1_ok: bool | None = None
+    ssh_stage2_ok: bool | None = None
+
+    @property
+    def changed(self) -> bool:
+        return self.confirmed_before != self.confirmed_after
+
+
 # ── ICMP helper ────────────────────────────────────────────────────────────────
 
 def _valid_ping_template(tpl: str) -> bool:
@@ -89,6 +102,120 @@ async def _ssh_check(server: ServerConfig) -> bool:
         return False
 
 
+def _confirmed_state_label(value: bool | None) -> str:
+    if value is True:
+        return "SSH доступен"
+    if value is False:
+        return "SSH недоступен"
+    return "статус не задан"
+
+
+def _probe_label(value: bool | None) -> str:
+    if value is None:
+        return "—"
+    return "OK" if value else "FAIL"
+
+
+def _live_ssh_summary(result: ConfirmedReachabilityCheck) -> str:
+    if result.ssh_stage2_ok is None:
+        if result.ssh_stage1_ok is True:
+            return "Прямо сейчас SSH до сервера проходит."
+        if result.ssh_stage1_ok is False:
+            return "Прямо сейчас SSH до сервера не проходит."
+        return "Прямо сейчас результат SSH-проверки не получен."
+
+    if result.ssh_stage1_ok is result.ssh_stage2_ok:
+        if result.ssh_stage2_ok:
+            return "Прямо сейчас SSH до сервера стабильно проходит."
+        return "Прямо сейчас SSH до сервера стабильно не проходит."
+
+    return "Прямо сейчас SSH дал переходный результат: две проверки не совпали."
+
+
+async def run_confirmed_reachability_check(
+    server: ServerConfig,
+    *,
+    confirmed_ok: bool | None,
+    ping_template: str | None,
+) -> ConfirmedReachabilityCheck:
+    """
+    Run the same reachability criteria as monitor confirmations, but immediately.
+
+    This helper is used by manual "Check" actions so that UI diagnostics match
+    monitor semantics and never overwrite confirmed state based on ICMP alone.
+    """
+    ssh_stage1_ok: bool | None = await _ssh_check(server)
+    icmp_ok = await _icmp_check(server, ping_template)
+    ssh_stage2_ok: bool | None = None
+    confirmed_after = confirmed_ok
+
+    if confirmed_ok is True:
+        if not ssh_stage1_ok:
+            ssh_stage2_ok = await _ssh_check(server)
+            if ssh_stage2_ok is False:
+                confirmed_after = False
+    elif confirmed_ok is False:
+        if ssh_stage1_ok:
+            ssh_stage2_ok = await _ssh_check(server)
+            if ssh_stage2_ok:
+                confirmed_after = True
+    else:
+        ssh_stage2_ok = await _ssh_check(server)
+        if ssh_stage1_ok and ssh_stage2_ok:
+            confirmed_after = True
+        elif (not ssh_stage1_ok) and (ssh_stage2_ok is False):
+            confirmed_after = False
+
+    return ConfirmedReachabilityCheck(
+        confirmed_before=confirmed_ok,
+        confirmed_after=confirmed_after,
+        icmp_ok=icmp_ok,
+        ssh_stage1_ok=ssh_stage1_ok,
+        ssh_stage2_ok=ssh_stage2_ok,
+    )
+
+
+def format_confirmed_reachability_report(result: ConfirmedReachabilityCheck) -> str:
+    lines = [
+        "🔍 <b>Проверка SSH-доступности по логике мониторинга</b>",
+        f"SSH #1: <b>{_probe_label(result.ssh_stage1_ok)}</b>",
+    ]
+    if result.ssh_stage2_ok is not None:
+        lines.append(f"SSH #2: <b>{_probe_label(result.ssh_stage2_ok)}</b>")
+    lines.append(f"ICMP (справочно): <b>{_probe_label(result.icmp_ok)}</b>")
+
+    lines.append("")
+    lines.append(_live_ssh_summary(result))
+
+    if result.changed:
+        if result.confirmed_before is None:
+            lines.append("Подтверждённый статус мониторинга ещё не сформирован.")
+        else:
+            lines.append("Этот живой результат не совпадает с подтверждённым статусом мониторинга в карточке ниже.")
+        lines.append(
+            "Если фоновый мониторинг повторно увидит и подтвердит такой же результат, "
+            "подтверждённый статус станет "
+            f"<b>{_confirmed_state_label(result.confirmed_after)}</b>."
+        )
+        lines.append("Кнопка показывает только живую проверку и не меняет подтверждённый статус напрямую.")
+        return "\n".join(lines)
+
+    if result.confirmed_before is None:
+        lines.append(
+            "Подтверждённый статус мониторинга ещё не сформирован: для него нужен стабильный результат SSH."
+        )
+    elif result.ssh_stage2_ok is not None and result.ssh_stage1_ok is not result.ssh_stage2_ok:
+        lines.append(
+            "Две SSH-проверки дали разный результат, поэтому подтверждённый статус мониторинга пока не меняется."
+        )
+    else:
+        lines.append(
+            "Этот живой результат согласуется с подтверждённым статусом мониторинга в карточке ниже."
+        )
+    lines.append("Кнопка показывает только живую проверку и не меняет подтверждённый статус напрямую.")
+    return "\n".join(lines)
+
+
 # ── Admin notification ────────────────────────────────────────────────────────
 
 async def _alert_admins(
@@ -100,11 +227,10 @@ async def _alert_admins(
     settings = context.bot_data["settings"]
     icon = "🟢" if is_now_reachable else "🔴"
     state = "снова доступен" if is_now_reachable else "недоступен"
-    method = "SSH" if not is_now_reachable else "ICMP + SSH"
     text = (
-        f"{icon} <b>Сервер «{server.name}»</b> {state}!\n"
-        f"Хост: <code>{server.ping_host}</code>\n"
-        f"Метод проверки: {method}\n"
+        f"{icon} <b>SSH к серверу «{server.name}»</b> {state}!\n"
+        f"Хост: <code>{server.ssh_host}</code>\n"
+        "Метод проверки: SSH\n"
         f"Время: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
     )
     await notify_admins(settings, svc, text)
@@ -113,14 +239,14 @@ async def _alert_admins(
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
 async def _get_confirmed_ok(server_id: int) -> bool | None:
-    """Read last_ping_ok from DB (the confirmed status)."""
+    """Read confirmed SSH availability from DB."""
     async with AsyncSessionLocal() as session:
         db_server = await session.get(Server, server_id)
         return db_server.last_ping_ok if db_server else None
 
 
 async def _set_confirmed_status(server_id: int, reachable: bool) -> None:
-    """Write confirmed status to DB."""
+    """Write confirmed SSH availability to DB."""
     async with AsyncSessionLocal() as session:
         db_server = await session.get(Server, server_id)
         if db_server is None:
@@ -251,14 +377,16 @@ def _make_confirm_job(
 
 async def check_servers_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Periodic job: ICMP-ping all active servers.
+    Periodic job: SSH-first monitor for all active servers.
 
-    - If ICMP fails for a server whose confirmed status is True (or None on first check):
-        → start offline-confirmation process (3 + 2 min via SSH).
-    - If ICMP succeeds for a server whose confirmed status is False:
-        → start online-confirmation process (3 + 2 min via SSH).
+    - Each cycle performs a primary SSH probe.
+    - If SSH fails for a server whose confirmed status is True (or None on first check):
+        → start offline-confirmation process via delayed SSH checks.
+    - If SSH succeeds for a server whose confirmed status is False (or None on first check):
+        → start online-confirmation process via delayed SSH checks.
+    - ICMP is auxiliary only and does not define the authoritative status.
     - last_ping_ok in DB is only updated when confirmation is complete.
-    - UI shows confirmed state, NOT raw ICMP results.
+    - UI shows confirmed SSH state, NOT raw ping results.
     """
     svc = _svc(context)
     if not svc.is_ready():
@@ -272,7 +400,6 @@ async def check_servers_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     ping_template = svc.get_str("PING_CMD_TEMPLATE", "")
 
     for server in servers:
-        icmp_ok = await _icmp_check(server, ping_template)
         confirmed_ok = await _get_confirmed_ok(server.id)
 
         # Server already has a pending confirmation — don't interfere
@@ -282,32 +409,35 @@ async def check_servers_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             continue
 
-        if not icmp_ok:
-            # Only start offline-confirm if server was confirmed online (True)
-            # or never checked before (None treated as online for first check)
-            if confirmed_ok is not False:
-                delay1 = svc.get_int("OFFLINE_CONFIRM_DELAY1_MINUTES", 3) * 60
-                token = secrets.token_hex(4)
-                pending_map[server.id] = _PendingState(direction="offline", stage=0, token=token)
-                context.job_queue.run_once(
-                    _make_confirm_job(server.id, token, "offline", 0),
-                    when=delay1,
-                    name=f"confirm:offline:{server.id}:{token}:0",
-                )
-                log.info(
-                    f"[monitor] server={server.name} ICMP fail — offline confirm scheduled in {delay1}s"
-                )
-        else:
-            # ICMP ok: only start online-confirm if server was confirmed down (False)
-            if confirmed_ok is False:
-                delay1 = svc.get_int("ONLINE_CONFIRM_DELAY1_MINUTES", 3) * 60
-                token = secrets.token_hex(4)
-                pending_map[server.id] = _PendingState(direction="online", stage=0, token=token)
-                context.job_queue.run_once(
-                    _make_confirm_job(server.id, token, "online", 0),
-                    when=delay1,
-                    name=f"confirm:online:{server.id}:{token}:0",
-                )
-                log.info(
-                    f"[monitor] server={server.name} ICMP ok (was DOWN) — online confirm scheduled in {delay1}s"
-                )
+        ssh_ok = await _ssh_check(server)
+
+        direction: Literal["offline", "online"] | None = None
+        if confirmed_ok is None:
+            direction = "online" if ssh_ok else "offline"
+        elif confirmed_ok and not ssh_ok:
+            direction = "offline"
+        elif confirmed_ok is False and ssh_ok:
+            direction = "online"
+
+        if direction is None:
+            continue
+
+        icmp_ok = await _icmp_check(server, ping_template)
+        delay_key = "OFFLINE_CONFIRM_DELAY1_MINUTES" if direction == "offline" else "ONLINE_CONFIRM_DELAY1_MINUTES"
+        delay1 = svc.get_int(delay_key, 3) * 60
+        token = secrets.token_hex(4)
+        pending_map[server.id] = _PendingState(direction=direction, stage=0, token=token)
+        context.job_queue.run_once(
+            _make_confirm_job(server.id, token, direction, 0),
+            when=delay1,
+            name=f"confirm:{direction}:{server.id}:{token}:0",
+        )
+        log.info(
+            "[monitor] server=%s primary SSH %s (ICMP %s, confirmed=%s) — %s confirm scheduled in %ss",
+            server.name,
+            "ok" if ssh_ok else "fail",
+            "ok" if icmp_ok else "fail",
+            confirmed_ok,
+            direction,
+            delay1,
+        )
